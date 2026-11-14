@@ -314,7 +314,7 @@ async fn connect_over(
     let channels = Channels {
         state: state.clone(),
         audio_tx,
-        events_tx,
+        events_tx: events_tx.clone(),
     };
     let udp = Udp {
         voice: udp_server.map(UdpVoice::new),
@@ -322,15 +322,7 @@ async fn connect_over(
         active: voice_over_udp.clone(),
     };
     tokio::spawn(async move {
-        let result = run(
-            reader,
-            writer,
-            channels,
-            udp,
-            server_rx,
-            run_cancel,
-        )
-        .await;
+        let result = run(reader, writer, channels, udp, server_rx, run_cancel).await;
 
         let reason = match result {
             Ok(()) => None,
@@ -392,6 +384,9 @@ impl Channels {
         // end the call; the handshake is where errors are fatal.
         if let Err(e) = apply_and_publish(&self.state, &self.events_tx, message) {
             log::warn!("Ignoring server message that could not be applied: {e}");
+            let _ = self.events_tx.send(MumbleEvent::MessageError {
+                reason: e.to_string(),
+            });
         }
     }
 }
