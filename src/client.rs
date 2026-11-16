@@ -598,13 +598,23 @@ mod tests {
     fn log_preview_elides_the_middle_of_long_messages() {
         let message = format!(r#"<img src="data:image/png;base64,{}" />"#, "A".repeat(200));
         let preview = log_preview(&message);
-        assert_eq!(preview, format!(r#""{}[...]{}""#, &message[..80], &message[message.len() - 20..]));
+        assert_eq!(
+            preview,
+            format!(
+                r#""{}[...]{}""#,
+                &message[..80],
+                &message[message.len() - 20..]
+            )
+        );
     }
 
     #[test]
     fn log_preview_counts_characters_not_bytes() {
         let message = "é".repeat(150);
-        assert_eq!(log_preview(&message), format!(r#""{}[...]{}""#, "é".repeat(80), "é".repeat(20)));
+        assert_eq!(
+            log_preview(&message),
+            format!(r#""{}[...]{}""#, "é".repeat(80), "é".repeat(20))
+        );
     }
     use tokio::io::DuplexStream;
     use tokio_util::codec::Framed;

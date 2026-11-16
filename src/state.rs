@@ -410,7 +410,6 @@ impl MumbleState {
             //     return Ok(None);
             //     // return Ok(Some(MumbleEvent::PermissionDenied));
             // }
-
             _ => {
                 log::warn!("Unhandled message: {:?}", message);
             }
