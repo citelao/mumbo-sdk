@@ -26,12 +26,6 @@ mumbo-sdk = { path = "../path/to/mumbo-sdk" }
 
 Needs a `tokio` runtime.
 
-## Development
+## Contributing
 
-```bash
-# Build
-cargo build
-
-# Test
-cargo test
-```
+See [CONTRIBUTING.md](./CONTRIBUTING.md).
