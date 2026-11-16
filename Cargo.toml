@@ -1,10 +1,10 @@
 [package]
-name = "mumble-protocol"
+name = "mumbo-sdk"
 version = "0.1.0"
-description = "A Mumble protocol client library, written for Mumbo"
+description = "A Mumble protocol client library, written for Mumbo and Blurt"
 edition = "2024"
 license = "AGPL-3.0-or-later"
-repository = "https://github.com/citelao/mumbo"
+repository = "https://github.com/citelao/mumbo-sdk"
 
 [dependencies]
 bytes = "1.12.1"
