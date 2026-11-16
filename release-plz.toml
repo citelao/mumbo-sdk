@@ -1,0 +1,4 @@
+[workspace]
+# Not published to crates.io: read the last released version from git tags (v0.1.0, ...)
+# instead of the registry, and only tag + create GitHub releases.
+git_only = true
