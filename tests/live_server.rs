@@ -345,6 +345,32 @@ async fn muted_users_send_no_voice() {
     listener.client.disconnect();
 }
 
+/// Murmur drops all voice from a muted user, including the packet that ends
+/// their burst, so listeners must stop showing them as speaking anyway.
+#[tokio::test]
+#[ignore = "needs a live Mumble server; see the top of this file"]
+async fn muting_mid_burst_stops_listeners_seeing_the_talker_speak() {
+    let talker = join("mid-burst-talker").await;
+    let mut listener = join("mid-burst-listener").await;
+    let talker_session = my_session(&talker);
+
+    talker.client.send_audio(&fake_opus(1), 0, false).unwrap();
+    until(&mut listener, "the talker to be speaking", |s| {
+        s.users.get(&talker_session)?.is_speaking.then_some(())
+    })
+    .await;
+
+    talker.client.set_self_mute(true).unwrap();
+    talker.client.send_audio(&fake_opus(2), 2, true).unwrap();
+    until(&mut listener, "the talker to stop speaking", |s| {
+        (!s.users.get(&talker_session)?.is_speaking).then_some(())
+    })
+    .await;
+
+    talker.client.disconnect();
+    listener.client.disconnect();
+}
+
 /// Murmur re-parses messages over `message_length` as XML, to measure them
 /// without their images, and rejects them if that fails. See
 /// `MumbleClient::send_channel_message`.
