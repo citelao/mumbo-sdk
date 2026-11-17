@@ -351,6 +351,12 @@ async fn muted_users_send_no_voice() {
     // Packets are relayed in order, so if the muted one had been sent, it
     // would arrive before this.
     talker.client.set_self_mute(false).unwrap();
+    // The unmute travels over TCP and voice over UDP, so voice sent right away
+    // can overtake it, and the server drops voice from a user it has as muted.
+    until(&mut talker, "the server to confirm the unmute", |s| {
+        (!s.current_user()?.self_mute).then_some(())
+    })
+    .await;
     talker.client.send_audio(&fake_opus(2), 2, false).unwrap();
     let next = next_packet_from(&mut listener, talker_session).await;
     assert_eq!(next.opus_data, fake_opus(2));
