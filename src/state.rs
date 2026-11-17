@@ -324,6 +324,13 @@ impl MumbleState {
                 merge(&mut user.self_deaf, m.self_deaf);
                 merge(&mut user.priority_speaker, m.priority_speaker);
                 merge(&mut user.recording, m.recording);
+                // Murmur drops all voice from a muted user, including the
+                // packet that would end their burst, so end it here. See the
+                // early return in `Server::processMsg`:
+                // https://github.com/mumble-voip/mumble/blob/v1.5.939/src/murmur/Server.cpp#L1174
+                if user.mute || user.suppress || user.self_mute {
+                    user.is_speaking = false;
+                }
                 log::info!("Updated user: {} (session: {})", user.name, user.session);
                 return Ok(Some(MumbleEvent::UsersChanged));
             }
@@ -814,16 +821,8 @@ mod tests {
         state.apply(user_state(1, "Alice")).unwrap();
         state.apply(voice(1, false)).unwrap();
 
-        // E.g. Alice mutes herself mid-sentence; her audio is still arriving.
-        state
-            .apply(crate::ServerToClientMessage::UserState(
-                crate::raw::UserState {
-                    session: Some(1),
-                    self_mute: Some(true),
-                    ..Default::default()
-                },
-            ))
-            .unwrap();
+        // E.g. Alice renames herself mid-sentence.
+        state.apply(user_state(1, "Alice Cooper")).unwrap();
 
         assert_eq!(speaking(&state), [1]);
     }
@@ -1265,5 +1264,34 @@ mod tests {
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert_eq!(me(&state), [1], "the original identity must survive");
+    }
+
+    /// Murmur drops all voice from a muted user, including the packet that
+    /// would end their burst, so muting must end it instead.
+    #[test]
+    fn muting_a_speaking_user_stops_them_speaking() {
+        type Mute = fn(&mut crate::raw::UserState);
+        let mutes: [(&str, Mute); 3] = [
+            ("self-mute", |m| m.self_mute = Some(true)),
+            ("server mute", |m| m.mute = Some(true)),
+            ("suppression", |m| m.suppress = Some(true)),
+        ];
+        for (name, mute) in mutes {
+            let mut state = MumbleState::default();
+            state.apply(user_state(1, "Alice")).unwrap();
+            state.apply(voice(1, false)).unwrap();
+            assert_eq!(speaking(&state), [1]);
+
+            let mut update = crate::raw::UserState {
+                session: Some(1),
+                ..Default::default()
+            };
+            mute(&mut update);
+            state
+                .apply(crate::ServerToClientMessage::UserState(update))
+                .unwrap();
+
+            assert!(speaking(&state).is_empty(), "{name}");
+        }
     }
 }

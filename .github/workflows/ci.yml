@@ -23,6 +23,25 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked
 
+  # Run integration tests against a real Mumble server (`dev/mumble-server`).
+  # Linux only: it's the only runner with Docker. The server is the same
+  # everywhere, and the client's OS differences are covered by `test`.
+  live-server:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: docker compose -f dev/mumble-server/compose.yaml up -d
+      # Build while the server boots.
+      - run: cargo test --test live_server --locked --no-run
+      # The port opens before the server is ready, so wait for its log line.
+      - name: Wait for the server
+        run: timeout 60 sh -c 'until docker compose -f dev/mumble-server/compose.yaml logs | grep -q "Server listening"; do sleep 1; done'
+      - run: cargo test --test live_server --locked -- --ignored
+      - if: failure()
+        run: docker compose -f dev/mumble-server/compose.yaml logs
+
   # Lints and formatting don't vary by OS; once is enough.
   lint:
     runs-on: ubuntu-latest
