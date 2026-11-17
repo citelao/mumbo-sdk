@@ -1,3 +1,16 @@
+// Copyright The Mumble Developers. All rights reserved.
+//
+// This file is a Rust port, with modifications, of Mumble's
+// src/crypto/CryptStateOCB2.cpp and src/tests/TestCrypt/TestCrypt.cpp, which
+// are governed by a BSD-style license. That license, including its copyright
+// notice, conditions, and disclaimer, is in the LICENSE-MUMBLE file at the
+// root of this repository.
+//
+// As upstream notes: this code implements OCB-AES128, whose algorithm design
+// was dedicated to the public domain.
+// https://www.cs.ucdavis.edu/~rogaway/ocb/license.htm
+// https://www.cs.ucdavis.edu/~rogaway/ocb/ocb-faq.htm
+
 //! OCB2-AES128 encryption for Mumble's UDP voice channel.
 //!
 //! A port of Mumble's `CryptStateOCB2` (src/crypto/CryptStateOCB2.cpp),
@@ -48,7 +61,6 @@ pub struct EncryptError;
 #[derive(Clone)]
 pub struct CryptState {
     cipher: Aes128,
-    raw_key: Block,
     encrypt_iv: Block,
     decrypt_iv: Block,
     /// For each low IV byte, the second IV byte last seen with it: rejects replays.
@@ -68,10 +80,9 @@ impl std::fmt::Debug for CryptState {
 impl CryptState {
     /// `encrypt_iv` is the server's `client_nonce`, `decrypt_iv` its `server_nonce`.
     pub fn new(key: &[u8], encrypt_iv: &[u8], decrypt_iv: &[u8]) -> Option<Self> {
-        let raw_key: Block = key.try_into().ok()?;
+        let key: Block = key.try_into().ok()?;
         Some(Self {
-            cipher: Aes128::new(GenericArray::from_slice(&raw_key)),
-            raw_key,
+            cipher: Aes128::new(GenericArray::from_slice(&key)),
             encrypt_iv: encrypt_iv.try_into().ok()?,
             decrypt_iv: decrypt_iv.try_into().ok()?,
             decrypt_history: [0; 256],
@@ -79,14 +90,11 @@ impl CryptState {
         })
     }
 
-    pub fn raw_key(&self) -> &[u8; BLOCK] {
-        &self.raw_key
-    }
-
     pub fn encrypt_iv(&self) -> &[u8; BLOCK] {
         &self.encrypt_iv
     }
 
+    #[cfg(test)]
     pub fn decrypt_iv(&self) -> &[u8; BLOCK] {
         &self.decrypt_iv
     }

@@ -2,7 +2,7 @@
 //! to the other, and over which transport.
 //!
 //! ```bash
-//! cargo run -p mumbo-sdk --example voice_check -- HOST [PORT] [PASSWORD]
+//! cargo run --example voice_check -- HOST [PORT] [PASSWORD]
 //! ```
 
 use std::time::{Duration, Instant};
@@ -30,10 +30,10 @@ async fn main() {
         username: Some(name.to_string()),
     };
 
-    let talker = connect(options("blurt-talker"))
+    let talker = connect(options("mumbo-talker"))
         .await
         .expect("talker connects");
-    let mut listener = connect(options("blurt-listener"))
+    let mut listener = connect(options("mumbo-listener"))
         .await
         .expect("listener connects");
 
