@@ -396,7 +396,7 @@ async fn run(
                             let mut state = state.lock().unwrap();
                             let me = state.current_user_session;
                             if let Some(event) = me.and_then(|me| state.set_speaking(me, !m.is_terminator)) {
-                                // Only fails if nobody is listening.
+                                // send() only fails if nobody is listening; ignore that
                                 let _ = events_tx.send(event);
                             }
                         }
