@@ -1,6 +1,6 @@
 [package]
 name = "mumbo-sdk"
-version = "0.1.0"
+version = "0.2.0"
 description = "A Mumble protocol client library, written for Mumbo and Blurt"
 edition = "2024"
 license = "AGPL-3.0-or-later"
