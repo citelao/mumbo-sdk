@@ -137,6 +137,16 @@ pub enum MumbleEvent {
     UsersChanged,
     ChannelsChanged,
     ChatMessage,
+    /// The server sent a message we couldn't apply.
+    /// The error is usually non-fatal, but worth reporting to listeners.
+    MessageError {
+        reason: String,
+    },
+    /// The connection has ended; no more events will follow.
+    /// `reason` is `None` for a clean disconnect, otherwise an error string.
+    Disconnected {
+        reason: Option<String>,
+    },
 }
 
 #[derive(Default, Clone, Debug, Serialize)]
