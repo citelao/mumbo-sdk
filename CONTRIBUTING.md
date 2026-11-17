@@ -14,18 +14,34 @@ cargo test
 
 ### Testing against a real server
 
-`tests/live_server.rs` checks behavior that depends on what a Mumble server
-actually does. Those tests are ignored by default, since they need a server:
+We include a compose file for simple local testing:
 
 ```bash
+# Start the server
 podman compose -f dev/mumble-server/compose.yaml up -d  # or `docker compose`
-cargo test --test live_server -- --ignored
+
+# Connect to `localhost:64738` with password `test`
+
+# Logs
+podman compose -f dev/mumble-server/compose.yaml logs -f
+
+# Stop the server
 podman compose -f dev/mumble-server/compose.yaml down
 ```
 
-To run it alongside another server on 64738 (e.g. Mumbo's), pick another port
-for both: `MUMBLE_PORT=64739` before each command. `MUMBLE_SERVER` and
-`MUMBLE_PASSWORD` point the tests at a different server.
+When running the real server, we also have some integration tests:
+
+```bash
+# Run integration tests against a live server
+cargo test --test live_server -- --ignored
+```
+
+To use custom servers, ports, or passwords, use `MUMBLE_SERVER`, `MUMBLE_PORT`, and `MUMBLE_PASSWORD`:
+
+```bash
+MUMBLE_PORT=65000 MUMBLE_PASSWORD=foo podman compose -f dev/mumble-server/compose.yaml up -d
+MUMBLE_PORT=65000 MUMBLE_PASSWORD=foo cargo test --test live_server -- --ignored
+```
 
 ## Submitting code
 

@@ -1,7 +1,8 @@
 # A Mumble server for the live-server tests (tests/live_server.rs).
 #
-# Named so it doesn't replace Mumbo's dev server (also in a `mumble-server`
-# folder); set MUMBLE_PORT to run both at once.
+# Environment vars:
+#
+# - `MUMBLE_PORT` (default: 64738) - which port it uses
 name: mumbo-sdk-mumble-server
 services:
   mumble-server:
@@ -9,7 +10,7 @@ services:
     image: docker.io/mumblevoip/mumble-server:v1.5.915
     ports:
       - "${MUMBLE_PORT:-64738}:64738/tcp"
-      - "${MUMBLE_PORT:-64738}:64738/udp" # forward, even though we only use TCP.
+      - "${MUMBLE_PORT:-64738}:64738/udp"
     environment:
       MUMBLE_SUPERUSER_PASSWORD: "superuser"
       MUMBLE_CONFIG_SERVERPASSWORD: "test"

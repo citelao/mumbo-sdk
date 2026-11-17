@@ -23,7 +23,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked
 
-  # Tests against a real Mumble server, the same one as `dev/mumble-server`.
+  # Run integration tests against a real Mumble server (`dev/mumble-server`).
   # Linux only: it's the only runner with Docker. The server is the same
   # everywhere, and the client's OS differences are covered by `test`.
   live-server:

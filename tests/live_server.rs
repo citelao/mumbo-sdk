@@ -1,19 +1,24 @@
-//! Tests against a real Mumble server, for behavior that depends on what the
-//! server actually does rather than what we think it does.
+//! Integration tests against a real Mumble server.
 //!
-//! They need a server, so they're `#[ignore]`d by default. Start one with
-//! `podman compose -f dev/mumble-server/compose.yaml up -d` (or `docker
-//! compose`), then run `cargo test --test live_server -- --ignored`. Set
-//! `MUMBLE_SERVER`, `MUMBLE_PORT` or `MUMBLE_PASSWORD` to use another server.
+//! They need a server so they're `#[ignore]`d by default. Start one with
+//! `podman compose -f dev/mumble-server/compose.yaml up -d` (or `docker compose`),
+//! then run `cargo test --test live_server -- --ignored`.
 //!
 //! Tests run in parallel against the one server, all in its root channel, so
-//! each must ignore what other tests' users do: match on its own users'
+//! each must ignore what other tests' users do: e.g. match on its own users'
 //! sessions and on unique message text.
+//!
+//! Environment vars:
+//!
+//! - `MUMBLE_SERVER` (default: `localhost`)
+//! - `MUMBLE_PORT` (default `64738`)
+//! - `MUMBLE_PASSWORD` (default: `test`)
 
 use mumbo_sdk::ServerToClientMessage;
 use mumbo_sdk::client::{Connection, ConnectionOptions, SelfMuteStatus, connect};
 use mumbo_sdk::raw::permission_denied::DenyType;
 use mumbo_sdk::state::{ConnectionStatus, MumbleState, TextMessage};
+use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 use tokio::sync::broadcast::error::RecvError;
@@ -23,9 +28,31 @@ use tokio::time::timeout;
 /// fails fast.
 const TIMEOUT: Duration = Duration::from_secs(5);
 
+/// A `Connection` that disconnects when dropped, even if the test panics.
+struct Joined(Connection);
+
+impl Deref for Joined {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        &self.0
+    }
+}
+
+impl DerefMut for Joined {
+    fn deref_mut(&mut self) -> &mut Connection {
+        &mut self.0
+    }
+}
+
+impl Drop for Joined {
+    fn drop(&mut self) {
+        self.0.client.disconnect();
+    }
+}
+
 /// Joins the server as a new user. `role` only makes the name readable in the
 /// server's logs.
-async fn join(role: &str) -> Connection {
+async fn join(role: &str) -> Joined {
     // Unique names: a duplicate name kicks the earlier session.
     static NEXT: AtomicU32 = AtomicU32::new(0);
     let username = format!(
@@ -44,9 +71,11 @@ async fn join(role: &str) -> Connection {
         password: Some(std::env::var("MUMBLE_PASSWORD").unwrap_or("test".into())),
         username: Some(username.clone()),
     };
-    connect(options)
-        .await
-        .unwrap_or_else(|e| panic!("{username} couldn't connect: {e}"))
+    Joined(
+        connect(options)
+            .await
+            .unwrap_or_else(|e| panic!("{username} couldn't connect: {e}")),
+    )
 }
 
 fn my_session(connection: &Connection) -> u32 {
@@ -147,8 +176,6 @@ async fn connecting_syncs_the_server_state() {
         s.message_length.zip(s.image_message_length)
     })
     .await;
-
-    me.client.disconnect();
 }
 
 #[tokio::test]
@@ -163,13 +190,10 @@ async fn users_see_each_other_join_and_leave() {
     })
     .await;
 
-    leaver.client.disconnect();
     until(&mut stayer, "the other user to leave", |s| {
         (!s.users.contains_key(&leaver_session)).then_some(())
     })
     .await;
-
-    stayer.client.disconnect();
 }
 
 #[tokio::test]
@@ -188,9 +212,6 @@ async fn channel_messages_reach_other_users() {
         received(s, sender_session, &text).then_some(())
     })
     .await;
-
-    sender.client.disconnect();
-    listener.client.disconnect();
 }
 
 #[tokio::test]
@@ -224,10 +245,6 @@ async fn direct_messages_reach_only_their_recipient() {
     .await;
     let state = bystander.client.state();
     assert!(!received(&state.lock().unwrap(), sender_session, &secret));
-
-    sender.client.disconnect();
-    recipient.client.disconnect();
-    bystander.client.disconnect();
 }
 
 #[tokio::test]
@@ -260,9 +277,6 @@ async fn self_mute_is_confirmed_and_seen_by_others() {
         (!s.users.get(&muter_session)?.self_mute).then_some(())
     })
     .await;
-
-    muter.client.disconnect();
-    listener.client.disconnect();
 }
 
 /// Receives the next voice packet `sender` sent to `listener`.
@@ -315,9 +329,6 @@ async fn voice_reaches_other_users_in_the_channel() {
         (!s.users.get(&talker_session)?.is_speaking).then_some(())
     })
     .await;
-
-    talker.client.disconnect();
-    listener.client.disconnect();
 }
 
 #[tokio::test]
@@ -340,9 +351,6 @@ async fn muted_users_send_no_voice() {
     talker.client.send_audio(&fake_opus(2), 2, false).unwrap();
     let next = next_packet_from(&mut listener, talker_session).await;
     assert_eq!(next.opus_data, fake_opus(2));
-
-    talker.client.disconnect();
-    listener.client.disconnect();
 }
 
 /// Murmur drops all voice from a muted user, including the packet that ends
@@ -366,9 +374,6 @@ async fn muting_mid_burst_stops_listeners_seeing_the_talker_speak() {
         (!s.users.get(&talker_session)?.is_speaking).then_some(())
     })
     .await;
-
-    talker.client.disconnect();
-    listener.client.disconnect();
 }
 
 /// Murmur re-parses messages over `message_length` as XML, to measure them
@@ -412,7 +417,4 @@ async fn long_messages_must_be_well_formed_xml() {
         received(s, sender_session, &well_formed).then_some(())
     })
     .await;
-
-    sender.client.disconnect();
-    listener.client.disconnect();
 }

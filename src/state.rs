@@ -315,7 +315,9 @@ impl MumbleState {
                 merge(&mut user.priority_speaker, m.priority_speaker);
                 merge(&mut user.recording, m.recording);
                 // Murmur drops all voice from a muted user, including the
-                // packet that would end their burst, so end it here.
+                // packet that would end their burst, so end it here. See the
+                // early return in `Server::processMsg`:
+                // https://github.com/mumble-voip/mumble/blob/v1.5.735/src/murmur/Server.cpp#L1150
                 if user.mute || user.suppress || user.self_mute {
                     user.is_speaking = false;
                 }
