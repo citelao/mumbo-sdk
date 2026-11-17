@@ -411,9 +411,7 @@ impl MumbleState {
             //     // return Ok(Some(MumbleEvent::PermissionDenied));
             // }
             _ => {
-                // Many messages (CodecVersion, PermissionQuery, ...) are simply not
-                // tracked in the state; that is expected, not a problem.
-                log::debug!("Unhandled message: {:?}", message);
+                log::warn!("Unhandled message: {:?}", message);
             }
         }
         Ok(None)
