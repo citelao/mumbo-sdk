@@ -653,6 +653,9 @@ impl MumbleClient {
 
     /// Mutes or unmutes the microphone: stops sending audio and tells the
     /// server (and so other users) that we are self-muted.
+    /// Note: the mute/unmute message is sent over TCP, whereas voice may be
+    /// sent over UDP, so the server may process some voice packets with an
+    /// outdated mute/unmute state. Not likely to be an issue in practice.
     pub fn set_self_mute(&self, muted: bool) -> Result<(), MumbleConnectionError> {
         self.self_muted.store(muted, Ordering::Relaxed);
         self.send(crate::ClientToServerMessage::UserState(Box::new(
