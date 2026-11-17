@@ -1,0 +1,12 @@
+{
+    "name": "mumbo-sdk",
+    "build": { "dockerfile": "Dockerfile" },
+    "remoteUser": "vscode",
+    // Allow SELinux hosts (Fedora, RHEL) to access the bind-mounted workspace.
+    "runArgs": ["--security-opt", "label=disable"],
+    "customizations": {
+        "vscode": {
+            "extensions": ["rust-lang.rust-analyzer"]
+        }
+    }
+}
