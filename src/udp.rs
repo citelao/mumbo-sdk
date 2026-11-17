@@ -93,6 +93,9 @@ impl UdpVoice {
     }
 
     fn set_active(&mut self, active: bool) {
+        // `fell_back` must survive further `set_active(false)` calls (e.g. a
+        // failed send just after falling back) until `tick` consumes it, so
+        // only reactivating clears it.
         let was_active = self.active.swap(active, Ordering::Relaxed);
         if active {
             self.fell_back = false;
