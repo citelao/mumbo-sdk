@@ -1,0 +1,18 @@
+# A Mumble server for the live-server tests (tests/live_server.rs).
+#
+# Named so it doesn't replace Mumbo's dev server (also in a `mumble-server`
+# folder); set MUMBLE_PORT to run both at once.
+name: mumbo-sdk-mumble-server
+services:
+  mumble-server:
+    # Pinned so CI doesn't change behavior under us; bump deliberately.
+    image: docker.io/mumblevoip/mumble-server:v1.5.915
+    ports:
+      - "${MUMBLE_PORT:-64738}:64738/tcp"
+      - "${MUMBLE_PORT:-64738}:64738/udp" # forward, even though we only use TCP.
+    environment:
+      MUMBLE_SUPERUSER_PASSWORD: "superuser"
+      MUMBLE_CONFIG_SERVERPASSWORD: "test"
+      # The tests connect many users at once, which would otherwise get
+      # localhost banned for 5 minutes (10 connections in 2 minutes).
+      MUMBLE_CONFIG_AUTOBANATTEMPTS: "0"
