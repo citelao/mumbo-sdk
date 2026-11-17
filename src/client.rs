@@ -217,7 +217,7 @@ async fn connect_over(
                 } else if let ServerToClientMessage::Ping(_) = msg {
                     // Pings are verbose.
                     log::trace!("Received server message: {:?}", msg);
-                } else {
+                } else if !matches!(msg, ServerToClientMessage::CryptSetup(_)) {
                     log::debug!("Received server message: {:?}", msg);
                 }
                 if debug_tx.receiver_count() > 0 {
@@ -545,10 +545,10 @@ impl MumbleClient {
     /// tunnel and moves to UDP once the server answers a UDP ping.
     ///
     /// This says nothing certain about the voice we receive: the server picks
-    /// that transport itself, and only switches to UDP once voice of ours has
-    /// reached it over UDP. Until we first speak, incoming voice arrives
-    /// through the TCP tunnel even while this returns `true`. The official
-    /// client behaves the same way.
+    /// that transport itself, and only switches to UDP once it receives a UDP
+    /// packet from us. Until then, incoming voice arrives through the TCP
+    /// tunnel even while this returns `true`. The official client behaves the
+    /// same way.
     pub fn is_voice_over_udp(&self) -> bool {
         self.voice_over_udp.load(Ordering::Relaxed)
     }

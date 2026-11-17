@@ -94,7 +94,11 @@ impl UdpVoice {
 
     fn set_active(&mut self, active: bool) {
         let was_active = self.active.swap(active, Ordering::Relaxed);
-        self.fell_back = was_active && !active;
+        if active {
+            self.fell_back = false;
+        } else if was_active {
+            self.fell_back = true;
+        }
     }
 
     /// Microseconds since `epoch`, as carried in pings.
