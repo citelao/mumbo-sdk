@@ -206,6 +206,9 @@ impl ServerToClientMessage {
                 payload: payload.to_vec(),
             },
         };
+        if let ServerToClientMessage::Unknown { type_id, .. } = &message {
+            log::warn!("Unknown message type {type_id}");
+        }
         Ok(message)
     }
 }
