@@ -317,7 +317,7 @@ impl MumbleState {
                 // Murmur drops all voice from a muted user, including the
                 // packet that would end their burst, so end it here. See the
                 // early return in `Server::processMsg`:
-                // https://github.com/mumble-voip/mumble/blob/v1.5.735/src/murmur/Server.cpp#L1150
+                // https://github.com/mumble-voip/mumble/blob/v1.5.939/src/murmur/Server.cpp#L1174
                 if user.mute || user.suppress || user.self_mute {
                     user.is_speaking = false;
                 }

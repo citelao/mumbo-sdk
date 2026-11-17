@@ -29,22 +29,22 @@ use tokio::time::timeout;
 const TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A `Connection` that disconnects when dropped, even if the test panics.
-struct Joined(Connection);
+struct TestConnection(Connection);
 
-impl Deref for Joined {
+impl Deref for TestConnection {
     type Target = Connection;
     fn deref(&self) -> &Connection {
         &self.0
     }
 }
 
-impl DerefMut for Joined {
+impl DerefMut for TestConnection {
     fn deref_mut(&mut self) -> &mut Connection {
         &mut self.0
     }
 }
 
-impl Drop for Joined {
+impl Drop for TestConnection {
     fn drop(&mut self) {
         self.0.client.disconnect();
     }
@@ -52,7 +52,7 @@ impl Drop for Joined {
 
 /// Joins the server as a new user. `role` only makes the name readable in the
 /// server's logs.
-async fn join(role: &str) -> Joined {
+async fn join(role: &str) -> TestConnection {
     // Unique names: a duplicate name kicks the earlier session.
     static NEXT: AtomicU32 = AtomicU32::new(0);
     let username = format!(
@@ -71,7 +71,7 @@ async fn join(role: &str) -> Joined {
         password: Some(std::env::var("MUMBLE_PASSWORD").unwrap_or("test".into())),
         username: Some(username.clone()),
     };
-    Joined(
+    TestConnection(
         connect(options)
             .await
             .unwrap_or_else(|e| panic!("{username} couldn't connect: {e}")),
@@ -189,6 +189,9 @@ async fn users_see_each_other_join_and_leave() {
         s.users.get(&leaver_session).map(|_| ())
     })
     .await;
+
+    // Dropping disconnects.
+    drop(leaver);
 
     until(&mut stayer, "the other user to leave", |s| {
         (!s.users.contains_key(&leaver_session)).then_some(())
@@ -351,6 +354,38 @@ async fn muted_users_send_no_voice() {
     talker.client.send_audio(&fake_opus(2), 2, false).unwrap();
     let next = next_packet_from(&mut listener, talker_session).await;
     assert_eq!(next.opus_data, fake_opus(2));
+}
+
+/// Murmur drops even the terminator packet of a muted user. `state.rs` relies
+/// on this to decide when to stop showing a muted user as speaking.
+#[tokio::test]
+#[ignore = "needs a live Mumble server; see the top of this file"]
+async fn muted_users_terminator_packets_are_dropped() {
+    let mut talker = join("terminator-talker").await;
+    let mut listener = join("terminator-listener").await;
+    let talker_session = my_session(&talker);
+
+    talker.client.send_audio(&fake_opus(1), 0, false).unwrap();
+    let first = next_packet_from(&mut listener, talker_session).await;
+    assert_eq!(first.opus_data, fake_opus(1));
+
+    talker.client.set_self_mute(true).unwrap();
+    until(&mut talker, "the server to confirm the mute", |s| {
+        s.current_user()?.self_mute.then_some(())
+    })
+    .await;
+    talker.client.send_audio(&fake_opus(2), 1, true).unwrap();
+
+    // Packets are relayed in order, so if the terminator had been sent, it
+    // would arrive before this.
+    talker.client.set_self_mute(false).unwrap();
+    until(&mut talker, "the server to confirm the unmute", |s| {
+        (!s.current_user()?.self_mute).then_some(())
+    })
+    .await;
+    talker.client.send_audio(&fake_opus(3), 2, false).unwrap();
+    let next = next_packet_from(&mut listener, talker_session).await;
+    assert_eq!(next.opus_data, fake_opus(3));
 }
 
 /// Murmur drops all voice from a muted user, including the packet that ends
