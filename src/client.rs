@@ -1,4 +1,4 @@
-use futures_util::{Sink, SinkExt, Stream, StreamExt, TryFutureExt, TryStreamExt};
+use futures_util::{Sink, SinkExt, Stream, StreamExt, TryStreamExt};
 use prost::Message;
 use serde::Serialize;
 use std::io;
@@ -16,6 +16,7 @@ use tokio_util::{
 
 mod accept_any_cert;
 
+use crate::state::MumbleEvent;
 use crate::{
     ServerToClientMessage, ServerToClientUdpMessage, UdpMessageId,
     state::{ConnectionStatus, MumbleState},
@@ -289,18 +290,30 @@ async fn connect_over(
     let (server_tx, server_rx) = mpsc::unbounded_channel::<crate::ClientToServerMessage>();
 
     let cancellation_token = CancellationToken::new();
-    tokio::spawn(
-        run(
+    let run_state = state.clone();
+    let run_cancel = cancellation_token.clone();
+    tokio::spawn(async move {
+        let result = run(
             reader,
             writer,
-            state.clone(),
+            run_state,
             audio_tx,
-            events_tx,
+            events_tx.clone(),
             server_rx,
-            cancellation_token.clone(),
+            run_cancel,
         )
-        .inspect_err(|e| log::error!("connection ended: {e}")),
-    );
+        .await;
+
+        let reason = match result {
+            Ok(()) => None,
+            Err(e) => {
+                log::error!("connection ended: {e}");
+                Some(e.to_string())
+            }
+        };
+        // Only fails if nobody is listening.
+        let _ = events_tx.send(crate::state::MumbleEvent::Disconnected { reason });
+    });
 
     Ok(Connection {
         client: MumbleClient {
@@ -362,6 +375,8 @@ async fn run(
                 // end the call; the handshake above is where errors are fatal.
                 if let Err(e) = apply_and_publish(&state, &events_tx, message) {
                     log::warn!("Ignoring server message that could not be applied: {e}");
+                    // Only fails if nobody is listening
+                    let _ = events_tx.send(MumbleEvent::MessageError { reason: e.to_string() });
                 }
             }
             message = server_rx.recv() => {
