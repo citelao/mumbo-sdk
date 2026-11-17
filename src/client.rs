@@ -311,7 +311,7 @@ async fn connect_over(
                 Some(e.to_string())
             }
         };
-        // Only fails if nobody is listening.
+        // send() only fails if nobody is listening; ignore that
         let _ = events_tx.send(crate::state::MumbleEvent::Disconnected { reason });
     });
 
@@ -375,7 +375,7 @@ async fn run(
                 // end the call; the handshake above is where errors are fatal.
                 if let Err(e) = apply_and_publish(&state, &events_tx, message) {
                     log::warn!("Ignoring server message that could not be applied: {e}");
-                    // Only fails if nobody is listening
+                    // send() only fails if nobody is listening; ignore that
                     let _ = events_tx.send(MumbleEvent::MessageError { reason: e.to_string() });
                 }
             }
@@ -410,7 +410,7 @@ async fn run(
                                 session: m.session.clone(),
                                 content: m.message.clone(),
                             }));
-                            // Only fails if nobody is listening.
+                            // send() only fails if nobody is listening; ignore that
                             let _ = events_tx.send(crate::state::MumbleEvent::ChatMessage);
                         }
                         _ => {
