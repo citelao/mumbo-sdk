@@ -1043,6 +1043,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn messages_the_state_cannot_apply_are_reported() {
+        let (mut connection, mut server) = connected().await;
+        drain_events(&mut connection);
+
+        server
+            .send(raw::UserState {
+                session: Some(1),
+                channel_id: Some(999),
+                ..Default::default()
+            })
+            .await;
+        server.send(user(3, "Bob")).await;
+
+        let event = next_event(&mut connection).await;
+        assert!(
+            matches!(&event, Some(MumbleEvent::MessageError { reason }) if reason.contains("999")),
+            "{event:?}"
+        );
+        // The connection carries on.
+        let event = next_event(&mut connection).await;
+        assert!(
+            matches!(event, Some(MumbleEvent::UsersChanged)),
+            "{event:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_or_undecodable_messages_are_not_reported_as_errors() {
+        let (mut connection, mut server) = connected().await;
+        drain_events(&mut connection);
+
+        server
+            .send(raw::UserStats {
+                session: Some(1),
+                ..Default::default()
+            })
+            .await;
+        server
+            .frames
+            .send(MumbleFrame {
+                type_id: raw::UserState::TYPE_ID,
+                payload: vec![0xff, 0xff, 0xff].into(),
+            })
+            .await
+            .unwrap();
+        server.send(user(3, "Bob")).await;
+
+        let event = next_event(&mut connection).await;
+        assert!(
+            matches!(event, Some(MumbleEvent::UsersChanged)),
+            "{event:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn disconnect_closes_the_connection() {
         let (mut connection, mut server) = connected().await;
 
@@ -1060,6 +1115,15 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn disconnecting_is_reported_as_clean() {
+        let (mut connection, _server) = connected().await;
+
+        connection.client.disconnect();
+
+        assert_eq!(disconnect_reason(&mut connection).await, None);
+    }
+
+    #[tokio::test]
     async fn server_hanging_up_closes_the_audio_channel() {
         let (mut connection, server) = connected().await;
 
@@ -1070,6 +1134,35 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn server_hanging_up_is_reported_as_clean() {
+        let (mut connection, server) = connected().await;
+
+        drop(server);
+
+        assert_eq!(disconnect_reason(&mut connection).await, None);
+    }
+
+    #[tokio::test]
+    async fn a_fatal_error_is_reported_with_its_reason() {
+        let (mut connection, mut server) = connected().await;
+
+        // A frame header claiming a payload over the codec's 16 MB limit.
+        use tokio::io::AsyncWriteExt;
+        server
+            .frames
+            .get_mut()
+            .write_all(&[0, 0, 0xff, 0xff, 0xff, 0xff])
+            .await
+            .unwrap();
+
+        let reason = disconnect_reason(&mut connection).await;
+        assert!(
+            reason.as_deref().is_some_and(|r| r.contains("too large")),
+            "{reason:?}"
         );
     }
 
@@ -1244,5 +1337,28 @@ mod tests {
         })
         .await
         .expect("condition never became true");
+    }
+
+    /// The next event, failing instead of hanging if none arrives.
+    async fn next_event(connection: &mut Connection) -> Option<MumbleEvent> {
+        tokio::time::timeout(TIMEOUT, connection.events.recv())
+            .await
+            .expect("no event arrived")
+    }
+
+    /// The reason the connection ended, skipping any events before it.
+    async fn disconnect_reason(connection: &mut Connection) -> Option<String> {
+        loop {
+            match next_event(connection).await {
+                Some(MumbleEvent::Disconnected { reason }) => {
+                    // No more events will follow.
+                    let after = next_event(connection).await;
+                    assert!(after.is_none(), "event after Disconnected: {after:?}");
+                    return reason;
+                }
+                Some(_) => continue,
+                None => panic!("events ended without a Disconnected"),
+            }
+        }
     }
 }
