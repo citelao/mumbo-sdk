@@ -217,7 +217,9 @@ async fn connect_over(
                 } else if let ServerToClientMessage::Ping(_) = msg {
                     // Pings are verbose.
                     log::trace!("Received server message: {:?}", msg);
-                } else if !matches!(msg, ServerToClientMessage::CryptSetup(_)) {
+                } else if let ServerToClientMessage::CryptSetup(_) = msg {
+                    // Do not log crypto keys!
+                } else {
                     log::debug!("Received server message: {:?}", msg);
                 }
                 if debug_tx.receiver_count() > 0 {
@@ -450,6 +452,8 @@ async fn run(
                     if let crate::ClientToServerMessage::UdpTunnel(crate::ClientToServerUdpMessage::Audio(_)) = message {
                         // Audio messages are noisy.
                         // log::trace!("Sending audio message: {:?}", msg);
+                    } else if let crate::ClientToServerMessage::CryptSetup(_) = message {
+                        // Do not log crypto keys!
                     } else {
                         log::trace!("Sending message to server: {:?}", message);
                     }
