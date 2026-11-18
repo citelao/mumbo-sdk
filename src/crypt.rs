@@ -134,20 +134,20 @@ impl CryptState {
         }
         assert_eq!(out.len(), packet.len() - HEADER_LEN, "output buffer size");
 
-        let save_iv = self.decrypt_iv;
+        // Work on a copy, so that failing leaves `self.decrypt_iv` untouched.
+        let mut iv = self.decrypt_iv;
         let iv_byte = packet[0];
-        let current = self.decrypt_iv[0];
-        let mut restore = false;
+        let current = iv[0];
         let mut lost: i32 = 0;
-        let mut late: i32 = 0;
+        let mut late = false;
 
         if current.wrapping_add(1) == iv_byte {
             // In order, as expected.
             if iv_byte > current {
-                self.decrypt_iv[0] = iv_byte;
+                iv[0] = iv_byte;
             } else if iv_byte < current {
-                self.decrypt_iv[0] = iv_byte;
-                increment(&mut self.decrypt_iv[1..]);
+                iv[0] = iv_byte;
+                increment(&mut iv[1..]);
             } else {
                 return Err(DecryptError::Rejected);
             }
@@ -162,50 +162,46 @@ impl CryptState {
 
             if iv_byte < current && diff > -LATE_WINDOW && diff < 0 {
                 // Late, without wraparound.
-                late = 1;
+                late = true;
                 lost = -1;
-                self.decrypt_iv[0] = iv_byte;
-                restore = true;
+                iv[0] = iv_byte;
             } else if iv_byte > current && diff > -LATE_WINDOW && diff < 0 {
                 // Late, from before the low byte wrapped (last was 0x02, here comes 0xff).
-                late = 1;
+                late = true;
                 lost = -1;
-                self.decrypt_iv[0] = iv_byte;
-                decrement(&mut self.decrypt_iv[1..]);
-                restore = true;
+                iv[0] = iv_byte;
+                decrement(&mut iv[1..]);
             } else if iv_byte > current && diff > 0 {
                 // Lost a few packets.
                 lost = i32::from(iv_byte) - i32::from(current) - 1;
-                self.decrypt_iv[0] = iv_byte;
+                iv[0] = iv_byte;
             } else if iv_byte < current && diff > 0 {
                 // Lost a few packets, and the low byte wrapped.
                 lost = 256 - i32::from(current) + i32::from(iv_byte) - 1;
-                self.decrypt_iv[0] = iv_byte;
-                increment(&mut self.decrypt_iv[1..]);
+                iv[0] = iv_byte;
+                increment(&mut iv[1..]);
             } else {
                 return Err(DecryptError::Rejected);
             }
 
-            if self.decrypt_history[usize::from(self.decrypt_iv[0])] == self.decrypt_iv[1] {
-                self.decrypt_iv = save_iv;
+            if self.decrypt_history[usize::from(iv[0])] == iv[1] {
                 return Err(DecryptError::Rejected);
             }
         }
 
-        let iv = self.decrypt_iv;
         let (tag, ok) = self.ocb_decrypt(&packet[HEADER_LEN..], out, &iv);
         if !ok || tag[..3] != packet[1..4] {
-            self.decrypt_iv = save_iv;
             return Err(DecryptError::BadTag);
         }
 
-        self.decrypt_history[usize::from(self.decrypt_iv[0])] = self.decrypt_iv[1];
-        if restore {
-            self.decrypt_iv = save_iv;
+        self.decrypt_history[usize::from(iv[0])] = iv[1];
+        // A late packet's IV is behind ours, so only an advance is kept.
+        if !late {
+            self.decrypt_iv = iv;
         }
 
         self.stats.good += 1;
-        apply_signed(&mut self.stats.late, late);
+        apply_signed(&mut self.stats.late, i32::from(late));
         apply_signed(&mut self.stats.lost, lost);
         Ok(())
     }
