@@ -28,8 +28,18 @@ const STALE_AFTER: Duration = Duration::from_secs(12);
 /// nonces (and don't ask more often than this).
 const RESYNC_AFTER: Duration = Duration::from_secs(5);
 
-/// Large enough for any datagram Mumble sends (it caps them at 1024 bytes).
-pub(crate) const MAX_DATAGRAM: usize = 2048;
+/// The largest datagram the Mumble protocol allows, encryption header
+/// included (`MAX_UDP_PACKET_SIZE` in the official source).
+pub(crate) const MAX_DATAGRAM: usize = 1024;
+/// The largest message that fits in a datagram once encrypted.
+const MAX_PLAIN: usize = MAX_DATAGRAM - HEADER_LEN;
+
+/// Whether `audio` is within the protocol's packet size limit. The limit
+/// applies even through the TCP tunnel, so the caller drops voice that is not.
+pub(crate) fn fits_datagram(audio: &raw_udp::Audio) -> bool {
+    // One more byte, for the message type, has to fit too.
+    audio.encoded_len() < MAX_PLAIN
+}
 
 /// What a received datagram turned out to be.
 #[derive(Debug)]
@@ -64,8 +74,6 @@ pub(crate) struct UdpVoice {
     rtt: Option<Duration>,
     /// Ping timestamps are microseconds since this instant.
     epoch: Instant,
-    plain: Vec<u8>,
-    sealed: Vec<u8>,
 }
 
 impl UdpVoice {
@@ -83,8 +91,6 @@ impl UdpVoice {
             last_resync_request: None,
             rtt: None,
             epoch: Instant::now(),
-            plain: Vec::with_capacity(MAX_DATAGRAM),
-            sealed: Vec::with_capacity(MAX_DATAGRAM),
         }
     }
 
@@ -209,17 +215,13 @@ impl UdpVoice {
     }
 
     /// Sends voice over UDP if it is working. Returns `false` if the caller
-    /// should send it through the TCP tunnel instead.
+    /// should send it through the TCP tunnel instead. `audio` must satisfy
+    /// [`fits_datagram`].
     pub async fn send_audio(&mut self, audio: &raw_udp::Audio) -> bool {
         if !self.is_active() {
             return false;
         }
-        self.plain.clear();
-        self.plain.push(raw_udp::Audio::TYPE_ID);
-        audio
-            .encode(&mut self.plain)
-            .expect("Vec<u8> grows as needed");
-        self.send_plain().await
+        self.send_message(audio).await
     }
 
     /// Decrypts and decodes one received datagram.
@@ -227,12 +229,13 @@ impl UdpVoice {
         let Some(crypt) = &mut self.crypt else {
             return Datagram::Nothing;
         };
-        if datagram.len() < HEADER_LEN {
+        if datagram.len() < HEADER_LEN || datagram.len() > MAX_DATAGRAM {
             return Datagram::Nothing;
         }
 
-        self.plain.resize(datagram.len() - HEADER_LEN, 0);
-        if let Err(e) = crypt.decrypt(datagram, &mut self.plain) {
+        let mut plain = [0u8; MAX_PLAIN];
+        let plain = &mut plain[..datagram.len() - HEADER_LEN];
+        if let Err(e) = crypt.decrypt(datagram, plain) {
             log::debug!("Dropping UDP packet: {e}");
             let since_good = self.last_good.or(self.keyed_at).map(|t| now - t);
             let since_request = self.last_resync_request.map(|t| now - t);
@@ -247,7 +250,7 @@ impl UdpVoice {
         }
         self.last_good = Some(now);
 
-        let Some((&kind, body)) = self.plain.split_first() else {
+        let Some((&kind, body)) = plain.split_first() else {
             return Datagram::Nothing;
         };
         match kind {
@@ -283,21 +286,30 @@ impl UdpVoice {
             timestamp: self.timestamp(now),
             ..Default::default()
         };
-        self.plain.clear();
-        self.plain.push(raw_udp::Ping::TYPE_ID);
-        ping.encode(&mut self.plain)
-            .expect("Vec<u8> grows as needed");
-        self.send_plain().await;
+        self.send_message(&ping).await;
     }
 
-    /// Encrypts `self.plain` and sends it. Returns whether it was sent.
-    async fn send_plain(&mut self) -> bool {
+    /// Encrypts and sends one message. Returns whether it was sent.
+    async fn send_message<M: UdpMessageId>(&mut self, message: &M) -> bool {
         let (Some(crypt), Some(socket)) = (&mut self.crypt, &self.socket) else {
             return false;
         };
-        self.sealed.resize(self.plain.len() + HEADER_LEN, 0);
-        crypt.encrypt(&self.plain, &mut self.sealed);
-        match socket.send(&self.sealed).await {
+        // A packet is one byte for the message type, then the message.
+        let len = 1 + message.encoded_len();
+        if len > MAX_PLAIN {
+            log::error!("Not sending a {len}-byte message over UDP: too large");
+            return false;
+        }
+        let mut plain = [0u8; MAX_PLAIN];
+        plain[0] = M::TYPE_ID;
+        let mut body = &mut plain[1..len];
+        message
+            .encode(&mut body)
+            .expect("the buffer holds `encoded_len` bytes");
+        let mut sealed = [0u8; MAX_DATAGRAM];
+        let sealed = &mut sealed[..len + HEADER_LEN];
+        crypt.encrypt(&plain[..len], sealed);
+        match socket.send(sealed).await {
             Ok(_) => true,
             Err(e) => {
                 // E.g. ECONNREFUSED after an ICMP port-unreachable.
@@ -422,6 +434,27 @@ mod tests {
         assert!(matches!(udp.on_datagram(&reply, now), Datagram::Nothing));
         assert!(udp.is_active());
         assert!(udp.send_audio(&audio).await);
+    }
+
+    #[tokio::test]
+    async fn the_largest_voice_that_fits_fills_a_datagram_exactly() {
+        let now = Instant::now();
+        let (mut udp, server) = keyed(now).await;
+        udp.on_datagram(&pong(&mut ServerCrypt::new()), now);
+        let mut buf = [0; MAX_DATAGRAM + 1];
+        server.recv(&mut buf).await.unwrap(); // the first ping
+
+        // 3 bytes of protobuf framing for an `opus_data` this long.
+        let mut audio = raw_udp::Audio {
+            opus_data: vec![0; MAX_PLAIN - 1 - 3],
+            ..Default::default()
+        };
+        assert!(fits_datagram(&audio));
+        assert!(udp.send_audio(&audio).await);
+        assert_eq!(server.recv(&mut buf).await.unwrap(), MAX_DATAGRAM);
+
+        audio.opus_data.push(0);
+        assert!(!fits_datagram(&audio));
     }
 
     #[tokio::test]

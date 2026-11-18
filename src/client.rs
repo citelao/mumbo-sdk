@@ -453,6 +453,14 @@ async fn run(
                     } else {
                         log::trace!("Sending message to server: {:?}", message);
                     }
+                    // The protocol's size limit applies to voice on either
+                    // transport; like the official client, don't send it.
+                    if let crate::ClientToServerMessage::UdpTunnel(crate::ClientToServerUdpMessage::Audio(audio)) = &message
+                        && !crate::udp::fits_datagram(audio)
+                    {
+                        log::warn!("Dropping a voice packet too large to send ({} bytes of Opus)", audio.opus_data.len());
+                        continue;
+                    }
                     // Voice goes over UDP when that works, else through the tunnel.
                     let sent_over_udp = match &message {
                         crate::ClientToServerMessage::UdpTunnel(crate::ClientToServerUdpMessage::Audio(audio)) => {
@@ -1036,6 +1044,17 @@ mod tests {
 
         assert_eq!((audio.sender_session, audio.opus_data), (1, vec![1, 2, 3]));
         assert_eq!(user_names(&connection.client), ["Alice", "me"]);
+    }
+
+    #[tokio::test]
+    async fn voice_too_large_for_the_protocol_is_not_sent() {
+        let (connection, mut server) = connected().await;
+
+        let too_large = vec![0; crate::udp::MAX_DATAGRAM];
+        connection.client.send_audio(&too_large, 7, false).unwrap();
+        connection.client.send_audio(&[2], 8, false).unwrap();
+
+        assert_eq!(server.receive_audio().await.frame_number, 8);
     }
 
     #[tokio::test]
