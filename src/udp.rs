@@ -185,7 +185,12 @@ impl UdpVoice {
         }
     }
 
-    /// Periodic upkeep: falls back to TCP if pings go unanswered, and pings.
+    /// Periodic upkeep; call it more often than the shorter of
+    /// [`PING_INTERVAL`] and [`PROBE_INTERVAL`].
+    ///
+    /// Falls back to the TCP tunnel once no ping has been answered for
+    /// [`STALE_AFTER`]. Sends a ping every [`PING_INTERVAL`] while voice is on
+    /// UDP, or every [`PROBE_INTERVAL`] while it is not.
     ///
     /// Returns a ping to send through the TCP tunnel when voice has just
     /// fallen back. The server keeps sending us voice over UDP until something
