@@ -19,7 +19,7 @@ use tokio_util::{
 mod accept_any_cert;
 
 use crate::state::MumbleEvent;
-use crate::udp::{Datagram, UdpVoice};
+use crate::udp::{Command, UdpVoice};
 use crate::{
     ServerToClientMessage, ServerToClientUdpMessage, UdpMessageId,
     state::{ConnectionStatus, MumbleState},
@@ -432,9 +432,9 @@ async fn run(
             received = udp.recv(&mut udp_buf) => {
                 match received {
                     Ok(len) => match udp.on_datagram(&udp_buf[..len], Instant::now()) {
-                        Datagram::Audio(audio) => deliver(ServerToClientMessage::UdpTunnel(ServerToClientUdpMessage::Audio(audio))),
-                        Datagram::RequestResync(setup) => writer.send(crate::ClientToServerMessage::CryptSetup(setup)).await?,
-                        Datagram::Nothing => {}
+                        Command::Audio(audio) => deliver(ServerToClientMessage::UdpTunnel(ServerToClientUdpMessage::Audio(audio))),
+                        Command::RequestResync(setup) => writer.send(crate::ClientToServerMessage::CryptSetup(setup)).await?,
+                        Command::Nothing => {}
                     },
                     // E.g. ECONNREFUSED after an ICMP port-unreachable: pings
                     // go unanswered and voice falls back to the tunnel.

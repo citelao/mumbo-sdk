@@ -43,7 +43,7 @@ pub(crate) fn fits_datagram(audio: &raw_udp::Audio) -> bool {
 
 /// What a received datagram turned out to be.
 #[derive(Debug)]
-pub(crate) enum Datagram {
+pub(crate) enum Command {
     /// Voice, for the app.
     Audio(raw_udp::Audio),
     /// Decryption keeps failing: send this `CryptSetup` over TCP to resync.
@@ -230,12 +230,12 @@ impl UdpVoice {
     }
 
     /// Decrypts and decodes one received datagram.
-    pub fn on_datagram(&mut self, datagram: &[u8], now: Instant) -> Datagram {
+    pub fn on_datagram(&mut self, datagram: &[u8], now: Instant) -> Command {
         let Some(crypt) = &mut self.crypt else {
-            return Datagram::Nothing;
+            return Command::Nothing;
         };
         if datagram.len() < HEADER_LEN || datagram.len() > MAX_DATAGRAM {
-            return Datagram::Nothing;
+            return Command::Nothing;
         }
 
         let mut plain = [0u8; MAX_PLAIN];
@@ -249,21 +249,21 @@ impl UdpVoice {
             {
                 log::info!("Requesting a UDP nonce resync");
                 self.last_resync_request = Some(now);
-                return Datagram::RequestResync(raw::CryptSetup::default());
+                return Command::RequestResync(raw::CryptSetup::default());
             }
-            return Datagram::Nothing;
+            return Command::Nothing;
         }
         self.last_good = Some(now);
 
         let Some((&kind, body)) = plain.split_first() else {
-            return Datagram::Nothing;
+            return Command::Nothing;
         };
         match kind {
             raw_udp::Audio::TYPE_ID => match raw_udp::Audio::decode(body) {
-                Ok(audio) => Datagram::Audio(audio),
+                Ok(audio) => Command::Audio(audio),
                 Err(e) => {
                     log::debug!("Dropping malformed UDP voice packet: {e}");
-                    Datagram::Nothing
+                    Command::Nothing
                 }
             },
             raw_udp::Ping::TYPE_ID => {
@@ -276,11 +276,11 @@ impl UdpVoice {
                         self.set_active(true);
                     }
                 }
-                Datagram::Nothing
+                Command::Nothing
             }
             _ => {
                 log::debug!("Dropping UDP packet of unknown type {kind}");
-                Datagram::Nothing
+                Command::Nothing
             }
         }
     }
@@ -436,7 +436,7 @@ mod tests {
         assert!(!udp.send_audio(&audio).await, "UDP is unproven");
 
         let reply = pong(&mut ServerCrypt::new());
-        assert!(matches!(udp.on_datagram(&reply, now), Datagram::Nothing));
+        assert!(matches!(udp.on_datagram(&reply, now), Command::Nothing));
         assert!(udp.is_active());
         assert!(udp.send_audio(&audio).await);
     }
@@ -473,7 +473,7 @@ mod tests {
         };
         let packet = ServerCrypt::new().seal(raw_udp::Audio::TYPE_ID, &audio);
 
-        let Datagram::Audio(got) = udp.on_datagram(&packet, now) else {
+        let Command::Audio(got) = udp.on_datagram(&packet, now) else {
             panic!("expected voice");
         };
         assert_eq!(got, audio);
@@ -514,10 +514,7 @@ mod tests {
 
         let later = start + STALE_AFTER + Duration::from_millis(1);
         let packet = server.seal(raw_udp::Audio::TYPE_ID, &voice);
-        assert!(matches!(
-            udp.on_datagram(&packet, later),
-            Datagram::Audio(_)
-        ));
+        assert!(matches!(udp.on_datagram(&packet, later), Command::Audio(_)));
         udp.tick(later).await;
         assert!(!udp.is_active());
     }
@@ -531,16 +528,16 @@ mod tests {
         let mut bad = || pong(&mut wrong);
 
         assert!(
-            matches!(udp.on_datagram(&bad(), start), Datagram::Nothing),
+            matches!(udp.on_datagram(&bad(), start), Command::Nothing),
             "too soon"
         );
         let later = start + RESYNC_AFTER + Duration::from_millis(1);
         assert!(matches!(
             udp.on_datagram(&bad(), later),
-            Datagram::RequestResync(_)
+            Command::RequestResync(_)
         ));
         assert!(
-            matches!(udp.on_datagram(&bad(), later), Datagram::Nothing),
+            matches!(udp.on_datagram(&bad(), later), Command::Nothing),
             "rate-limited"
         );
     }
