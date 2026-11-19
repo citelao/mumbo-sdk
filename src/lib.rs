@@ -273,7 +273,7 @@ mod tests {
     // with the zod schema, so drift on either side fails a test.
     #[test]
     fn server_messages_match_shared_fixture() {
-        let samples = vec![
+        let mut samples = vec![
             ServerToClientMessage::Version(Default::default()),
             ServerToClientMessage::UdpTunnel(ServerToClientUdpMessage::Audio(raw_udp::Audio {
                 header: Some(raw_udp::audio::Header::Context(2)),
@@ -325,11 +325,13 @@ mod tests {
                 payload: vec![1, 2],
             },
         ];
+        samples.extend(populated_server_messages());
         let fixture: serde_json::Value =
             serde_json::from_str(include_str!("../fixtures/server_to_client_messages.json"))
                 .unwrap();
 
         assert_eq!(serde_json::to_value(&samples).unwrap(), fixture);
+        assert_fully_sampled(&fixture);
 
         let covered: std::collections::BTreeSet<_> = samples.iter().map(variant_name).collect();
         assert_eq!(
@@ -339,11 +341,213 @@ mod tests {
         );
     }
 
+    /// Fails unless every field path is populated (not null, `""`, `[]` or
+    /// `{}`) in at least one sample, so consumers parsing the fixtures (e.g.
+    /// Mumbo's zod) see a real value of every field's type. Tagged objects
+    /// (a string `type`) are tracked per variant, e.g. `$<Ping>.data.good`.
+    pub(crate) fn assert_fully_sampled(samples: &serde_json::Value) {
+        fn walk(
+            value: &serde_json::Value,
+            path: String,
+            seen: &mut std::collections::BTreeMap<String, bool>,
+        ) {
+            use serde_json::Value;
+            let populated = match value {
+                Value::Null => false,
+                Value::String(s) => !s.is_empty(),
+                Value::Array(items) => !items.is_empty(),
+                Value::Object(map) => !map.is_empty(),
+                Value::Bool(_) | Value::Number(_) => true,
+            };
+            *seen.entry(path.clone()).or_default() |= populated;
+            match value {
+                Value::Object(map) => {
+                    let path = match map.get("type") {
+                        Some(Value::String(tag)) => format!("{path}<{tag}>"),
+                        _ => path,
+                    };
+                    for (key, child) in map {
+                        walk(child, format!("{path}.{key}"), seen);
+                    }
+                }
+                Value::Array(items) => {
+                    for item in items {
+                        walk(item, format!("{path}[]"), seen);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut seen = std::collections::BTreeMap::new();
+        for sample in samples.as_array().expect("fixtures are arrays") {
+            walk(sample, "$".to_string(), &mut seen);
+        }
+        let unsampled: Vec<_> = seen
+            .into_iter()
+            .filter_map(|(path, populated)| (!populated).then_some(path))
+            .collect();
+        assert!(
+            unsampled.is_empty(),
+            "never populated in any sample: {unsampled:#?}"
+        );
+    }
+
+    /// One sample per variant with every field set, after the minimal samples
+    /// above, so `assert_fully_sampled` sees a value for every field.
+    fn populated_server_messages() -> Vec<ServerToClientMessage> {
+        // Mumble 1.5.735, in the current (v2) version format and the legacy (v1)
+        // one, whose patch byte saturates at 255.
+        const VERSION_V1: u32 = (1 << 16) | (5 << 8) | 255;
+        const VERSION_V2: u64 = (1 << 48) | (5 << 32) | (735 << 16);
+        vec![
+            ServerToClientMessage::Version(raw::Version {
+                version_v1: Some(VERSION_V1),
+                version_v2: Some(VERSION_V2),
+                release: Some("1.5.735".to_string()),
+                os: Some("Linux".to_string()),
+                os_version: Some("Ubuntu 24.04".to_string()),
+            }),
+            ServerToClientMessage::UdpTunnel(ServerToClientUdpMessage::Audio(raw_udp::Audio {
+                sender_session: 7,
+                frame_number: 42,
+                opus_data: vec![3, 4],
+                positional_data: vec![1.5, 0.0, -2.0],
+                volume_adjustment: 0.5,
+                is_terminator: true,
+                header: Some(raw_udp::audio::Header::Target(1)),
+            })),
+            ServerToClientMessage::UdpTunnel(ServerToClientUdpMessage::Ping(raw_udp::Ping {
+                timestamp: 123,
+                request_extended_information: true,
+                server_version_v2: VERSION_V2,
+                user_count: 3,
+                max_user_count: 100,
+                max_bandwidth_per_user: 558000,
+            })),
+            ServerToClientMessage::Ping(raw::Ping {
+                timestamp: Some(123),
+                good: Some(40),
+                late: Some(1),
+                lost: Some(2),
+                resync: Some(0),
+                udp_packets: Some(43),
+                tcp_packets: Some(45),
+                udp_ping_avg: Some(10.5),
+                udp_ping_var: Some(1.25),
+                tcp_ping_avg: Some(12.5),
+                tcp_ping_var: Some(2.5),
+            }),
+            ServerToClientMessage::Reject(raw::Reject {
+                r#type: Some(raw::reject::RejectType::WrongServerPw as i32),
+                reason: Some("Wrong server password".to_string()),
+            }),
+            ServerToClientMessage::ServerSync(raw::ServerSync {
+                session: Some(5),
+                max_bandwidth: Some(558000),
+                welcome_text: Some("Welcome to <b>Mumbo</b>!".to_string()),
+                permissions: Some(0x0e),
+            }),
+            ServerToClientMessage::ChannelRemove(raw::ChannelRemove { channel_id: 4 }),
+            ServerToClientMessage::ChannelState(raw::ChannelState {
+                channel_id: Some(4),
+                parent: Some(0),
+                name: Some("Games".to_string()),
+                links: vec![3],
+                description: Some("Play together".to_string()),
+                links_add: vec![5],
+                links_remove: vec![6],
+                temporary: Some(true),
+                position: Some(-1),
+                description_hash: Some(vec![1, 2, 3, 4]),
+                max_users: Some(10),
+                is_enter_restricted: Some(true),
+                can_enter: Some(false),
+            }),
+            ServerToClientMessage::UserRemove(raw::UserRemove {
+                session: 7,
+                actor: Some(5),
+                reason: Some("Spamming".to_string()),
+                ban: Some(true),
+            }),
+            ServerToClientMessage::UserState(raw::UserState {
+                session: Some(7),
+                actor: Some(5),
+                name: Some("Alice".to_string()),
+                user_id: Some(12),
+                channel_id: Some(3),
+                mute: Some(false),
+                deaf: Some(false),
+                suppress: Some(true),
+                self_mute: Some(true),
+                self_deaf: Some(false),
+                // PNG magic number.
+                texture: Some(vec![137, 80, 78, 71]),
+                plugin_context: Some(vec![1, 2]),
+                plugin_identity: Some("alice@game".to_string()),
+                comment: Some("Hello!".to_string()),
+                hash: Some("a1b2c3d4".to_string()),
+                comment_hash: Some(vec![5, 6]),
+                texture_hash: Some(vec![7, 8]),
+                priority_speaker: Some(false),
+                recording: Some(false),
+                temporary_access_tokens: vec!["letmein".to_string()],
+                listening_channel_add: vec![4],
+                listening_channel_remove: vec![2],
+                listening_volume_adjustment: vec![raw::user_state::VolumeAdjustment {
+                    listening_channel: Some(4),
+                    volume_adjustment: Some(0.5),
+                }],
+            }),
+            ServerToClientMessage::TextMessage(raw::TextMessage {
+                actor: Some(5),
+                session: vec![7],
+                channel_id: vec![3],
+                tree_id: vec![0],
+                message: "Hi all".to_string(),
+            }),
+            ServerToClientMessage::PermissionDenied(raw::PermissionDenied {
+                permission: Some(0x4),
+                channel_id: Some(3),
+                session: Some(5),
+                reason: Some("Invalid username".to_string()),
+                r#type: Some(raw::permission_denied::DenyType::UserName as i32),
+                name: Some("Al!ce".to_string()),
+            }),
+            ServerToClientMessage::CryptSetup(raw::CryptSetup {
+                key: Some(vec![1, 2, 3, 4]),
+                client_nonce: Some(vec![5, 6, 7, 8]),
+                server_nonce: Some(vec![9, 10, 11, 12]),
+            }),
+            ServerToClientMessage::PermissionQuery(raw::PermissionQuery {
+                channel_id: Some(3),
+                permissions: Some(0x0e),
+                flush: Some(true),
+            }),
+            ServerToClientMessage::CodecVersion(raw::CodecVersion {
+                alpha: -2147483637,
+                beta: 0,
+                prefer_alpha: true,
+                opus: Some(true),
+            }),
+            ServerToClientMessage::ServerConfig(raw::ServerConfig {
+                max_bandwidth: Some(558000),
+                welcome_text: Some("Welcome!".to_string()),
+                allow_html: Some(true),
+                message_length: Some(5000),
+                image_message_length: Some(131072),
+                max_users: Some(100),
+                recording_allowed: Some(true),
+            }),
+        ]
+    }
+
     /// Every variant, including UDP subtypes. Keep in sync with `variant_name`,
     /// whose exhaustive match stops compiling when a variant is added.
     const EVERY_VARIANT: &[&str] = &[
         "Version",
-        "UdpTunnel/Audio",
+        "UdpTunnel/Audio/Target",
+        "UdpTunnel/Audio/Context",
         "UdpTunnel/Ping",
         "Ping",
         "Reject",
@@ -366,8 +570,12 @@ mod tests {
     fn variant_name(message: &ServerToClientMessage) -> &'static str {
         match message {
             ServerToClientMessage::Version(_) => "Version",
-            ServerToClientMessage::UdpTunnel(ServerToClientUdpMessage::Audio(_)) => {
-                "UdpTunnel/Audio"
+            ServerToClientMessage::UdpTunnel(ServerToClientUdpMessage::Audio(audio)) => {
+                match audio.header {
+                    None => "UdpTunnel/Audio/no header",
+                    Some(raw_udp::audio::Header::Target(_)) => "UdpTunnel/Audio/Target",
+                    Some(raw_udp::audio::Header::Context(_)) => "UdpTunnel/Audio/Context",
+                }
             }
             ServerToClientMessage::UdpTunnel(ServerToClientUdpMessage::Ping(_)) => "UdpTunnel/Ping",
             ServerToClientMessage::Ping(_) => "Ping",

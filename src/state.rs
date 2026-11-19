@@ -653,6 +653,32 @@ mod tests {
             serde_json::from_str(include_str!("../fixtures/users.json")).unwrap();
 
         assert_eq!(serde_json::to_value(state.users()).unwrap(), fixture);
+        crate::tests::assert_fully_sampled(&fixture);
+    }
+
+    // Timestamps come from the clock in `apply`, so build samples directly.
+    #[test]
+    fn chat_messages_match_shared_fixture() {
+        let timestamp = DateTime::parse_from_rfc3339("2026-01-02T03:04:05Z")
+            .unwrap()
+            .to_utc();
+        let samples = vec![
+            TextMessage::ChatTextMessage(ChatTextMessage {
+                timestamp,
+                actor: Some(7),
+                session: vec![2, 3],
+                content: "Hi <b>there</b>".to_string(),
+            }),
+            TextMessage::ServerTextMessage(ServerTextMessage {
+                timestamp: timestamp + chrono::Duration::milliseconds(678),
+                content: "Welcome!".to_string(),
+            }),
+        ];
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../fixtures/chat_messages.json")).unwrap();
+
+        assert_eq!(serde_json::to_value(samples).unwrap(), fixture);
+        crate::tests::assert_fully_sampled(&fixture);
     }
 
     #[test]
@@ -937,6 +963,7 @@ mod tests {
             serde_json::from_str(include_str!("../fixtures/channels.json")).unwrap();
 
         assert_eq!(serde_json::to_value(state.channels()).unwrap(), fixture);
+        crate::tests::assert_fully_sampled(&fixture);
     }
 
     #[test]
