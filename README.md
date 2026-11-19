@@ -40,3 +40,5 @@ Parts of it are derived from [Mumble](https://github.com/mumble-voip/mumble) and
 - `src/proto/`, Mumble's protobuf definitions.
 
 If you distribute an app built on mumbo-sdk in binary form, include that notice in your own third-party notices.
+
+Additional Permissions For Submission to Apple App Store: Provided that you are otherwise in compliance with AGPL-3.0-or-later, for each covered work you convey (including without limitation making the Corresponding Source available in compliance with Section 6 of the AGPL), the authors of Mumbo SDK also grants you the additional permission to convey through the Apple App Store non-source executable versions of the Program as incorporated into each applicable covered work as Executable Versions only under the Mozilla Public License version 2.0 (https://www.mozilla.org/en-US/MPL/2.0/).
