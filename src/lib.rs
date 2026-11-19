@@ -11,7 +11,9 @@ pub mod raw_udp {
 
 pub mod client;
 pub mod codec;
+mod crypt;
 pub mod state;
+mod udp;
 
 pub trait TcpMessageId: prost::Message + Default {
     const TYPE_ID: u16;
@@ -216,7 +218,7 @@ impl ServerToClientMessage {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum ClientToServerUdpMessage {
     Audio(raw_udp::Audio),
-    // Ping(raw_udp::Ping),
+    Ping(raw_udp::Ping),
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -228,6 +230,7 @@ pub enum ClientToServerMessage {
     Ping(raw::Ping),
     TextMessage(raw::TextMessage),
     UserState(Box<raw::UserState>),
+    CryptSetup(raw::CryptSetup),
 }
 
 impl ClientToServerMessage {
@@ -239,7 +242,12 @@ impl ClientToServerMessage {
                     let mut payload = vec![raw_udp::Audio::TYPE_ID];
                     payload.extend(audio.encode_to_vec());
                     Ok((raw::UdpTunnel::TYPE_ID, payload))
-                } // ClientToServerUdpMessage::Ping(ping) => Ok((raw_udp::Ping::TYPE_ID, ping.encode_to_vec())),
+                }
+                ClientToServerUdpMessage::Ping(ping) => {
+                    let mut payload = vec![raw_udp::Ping::TYPE_ID];
+                    payload.extend(ping.encode_to_vec());
+                    Ok((raw::UdpTunnel::TYPE_ID, payload))
+                }
             },
             ClientToServerMessage::Authenticate(msg) => {
                 Ok((raw::Authenticate::TYPE_ID, msg.encode_to_vec()))
@@ -250,6 +258,9 @@ impl ClientToServerMessage {
             }
             ClientToServerMessage::UserState(msg) => {
                 Ok((raw::UserState::TYPE_ID, msg.encode_to_vec()))
+            }
+            ClientToServerMessage::CryptSetup(msg) => {
+                Ok((raw::CryptSetup::TYPE_ID, msg.encode_to_vec()))
             }
         }
     }
@@ -262,6 +273,21 @@ pub fn add(left: u64, right: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tunnelled_ping_is_a_udp_tunnel_frame_holding_the_udp_packet() {
+        let ping = raw_udp::Ping {
+            timestamp: 7,
+            ..Default::default()
+        };
+        let message = ClientToServerMessage::UdpTunnel(ClientToServerUdpMessage::Ping(ping));
+
+        let (type_id, payload) = message.encode().unwrap();
+
+        assert_eq!(type_id, raw::UdpTunnel::TYPE_ID);
+        assert_eq!(payload[0], raw_udp::Ping::TYPE_ID);
+        assert_eq!(raw_udp::Ping::decode(&payload[1..]).unwrap().timestamp, 7);
+    }
 
     #[test]
     fn it_works() {

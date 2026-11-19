@@ -334,6 +334,43 @@ async fn voice_reaches_other_users_in_the_channel() {
     .await;
 }
 
+/// Voice starts on the TCP tunnel and moves to UDP once a ping has made the
+/// round trip, which proves the keys and encryption work in both directions.
+#[tokio::test]
+#[ignore = "needs a live Mumble server; see the top of this file"]
+async fn voice_moves_to_udp() {
+    let talker = join("udp-talker").await;
+    let mut listener = join("udp-listener").await;
+    let talker_session = my_session(&talker);
+
+    timeout(TIMEOUT, async {
+        while !(talker.client.is_voice_over_udp() && listener.client.is_voice_over_udp()) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "timed out waiting for voice over UDP: talker {}, listener {}",
+            talker.client.is_voice_over_udp(),
+            listener.client.is_voice_over_udp()
+        )
+    });
+
+    for i in 0..3 {
+        talker
+            .client
+            .send_audio(&fake_opus(i), i.into(), i == 2)
+            .unwrap();
+    }
+    for i in 0..3 {
+        let packet = next_packet_from(&mut listener, talker_session).await;
+        assert_eq!(packet.opus_data, fake_opus(i));
+    }
+    assert!(talker.client.is_voice_over_udp());
+    assert!(listener.client.is_voice_over_udp());
+}
+
 #[tokio::test]
 #[ignore = "needs a live Mumble server; see the top of this file"]
 async fn muted_users_send_no_voice() {
@@ -351,6 +388,12 @@ async fn muted_users_send_no_voice() {
     // Packets are relayed in order, so if the muted one had been sent, it
     // would arrive before this.
     talker.client.set_self_mute(false).unwrap();
+    // The unmute travels over TCP and voice over UDP, so voice packets sent
+    // just after the unmute might still be dropped by the server.
+    until(&mut talker, "the server to confirm the unmute", |s| {
+        (!s.current_user()?.self_mute).then_some(())
+    })
+    .await;
     talker.client.send_audio(&fake_opus(2), 2, false).unwrap();
     let next = next_packet_from(&mut listener, talker_session).await;
     assert_eq!(next.opus_data, fake_opus(2));

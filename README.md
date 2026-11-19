@@ -29,3 +29,14 @@ Needs a `tokio` runtime.
 ## Contributing
 
 See [CONTRIBUTING.md](./CONTRIBUTING.md).
+
+## License
+
+mumbo-sdk is licensed under [AGPL-3.0-or-later](./LICENSE).
+
+Parts of it are derived from [Mumble](https://github.com/mumble-voip/mumble) and remain under Mumble's BSD 3-Clause license, reproduced in [LICENSE-MUMBLE](./LICENSE-MUMBLE):
+
+- `src/crypt.rs`, a port of Mumble's OCB2-AES128 crypt state and its tests.
+- `src/proto/`, Mumble's protobuf definitions.
+
+If you distribute an app built on mumbo-sdk in binary form, include that notice in your own third-party notices.

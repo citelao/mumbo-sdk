@@ -2,10 +2,12 @@ use futures_util::{Sink, SinkExt, Stream, StreamExt, TryStreamExt};
 use prost::Message;
 use serde::Serialize;
 use std::io;
+use std::net::SocketAddr;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{broadcast, mpsc};
@@ -17,6 +19,7 @@ use tokio_util::{
 mod accept_any_cert;
 
 use crate::state::MumbleEvent;
+use crate::udp::{Command, UdpVoice};
 use crate::{
     ServerToClientMessage, ServerToClientUdpMessage, UdpMessageId,
     state::{ConnectionStatus, MumbleState},
@@ -33,6 +36,9 @@ pub struct MumbleClient {
     // Shared across clones so the audio loop sees mute changes immediately,
     // without waiting for the server to echo our UserState back.
     self_muted: Arc<AtomicBool>,
+
+    // Whether voice currently goes over UDP (vs. the TCP tunnel).
+    voice_over_udp: Arc<AtomicBool>,
 }
 
 /// Self-mute as the user sees it: what they asked for, and whether the server
@@ -176,6 +182,10 @@ pub async fn connect(options: ConnectionOptions) -> Result<Connection, MumbleCon
 
     let server_name = rustls::pki_types::ServerName::try_from(server.clone())?;
     let tcp = tokio::net::TcpStream::connect((server.clone(), port)).await?;
+    // Low latency matters more than fewer packets: voice may be tunnelled here.
+    tcp.set_nodelay(true)?;
+    // Voice goes over UDP to the same address the TCP connection reached.
+    let udp_server = tcp.peer_addr()?;
 
     // TODO: we accept any cert because many servers self-sign. We should figure
     // out how to handle this better.
@@ -183,14 +193,16 @@ pub async fn connect(options: ConnectionOptions) -> Result<Connection, MumbleCon
         .connect(server_name, tcp)
         .await?;
 
-    connect_over(tls, options).await
+    connect_over(tls, options, Some(udp_server)).await
 }
 
 /// Runs the Mumble handshake and starts the connection over an already-open
-/// stream: TLS in production, an in-memory pipe in tests.
+/// stream: TLS in production, an in-memory pipe in tests. Without a
+/// `udp_server`, voice only goes through the TCP tunnel.
 async fn connect_over(
     stream: impl AsyncRead + AsyncWrite + Send + 'static,
     options: ConnectionOptions,
+    udp_server: Option<SocketAddr>,
 ) -> Result<Connection, MumbleConnectionError> {
     const DEBUG_CHANNEL_CAPACITY: usize = 512;
     let (debug_tx, debug_rx) = broadcast::channel::<ServerToClientMessage>(DEBUG_CHANNEL_CAPACITY);
@@ -205,6 +217,8 @@ async fn connect_over(
                 } else if let ServerToClientMessage::Ping(_) = msg {
                     // Pings are verbose.
                     log::trace!("Received server message: {:?}", msg);
+                } else if let ServerToClientMessage::CryptSetup(_) = msg {
+                    // Do not log crypto keys!
                 } else {
                     log::debug!("Received server message: {:?}", msg);
                 }
@@ -279,11 +293,23 @@ async fn connect_over(
     const _: () = assert!(AUDIO_CHANNEL_BUFFER_SIZE > (10 * 1000 / 20));
     let (audio_tx, audio_rx) = tokio::sync::mpsc::channel(AUDIO_CHANNEL_BUFFER_SIZE);
 
+    let voice_over_udp = Arc::new(AtomicBool::new(false));
+    let mut udp = UdpVoice::new(udp_server, voice_over_udp.clone());
+
     // Let's wait for the handshake to complete.
     while state.lock().unwrap().connection_status() == &ConnectionStatus::Connecting {
         let Some(message) = reader.try_next().await? else {
             return Err(MumbleConnectionError::UnexpectedServerClose);
         };
+        // The server sends its UDP keys during the handshake.
+        if let ServerToClientMessage::CryptSetup(setup) = &message {
+            if let Some(reply) = udp.on_crypt_setup(setup, Instant::now()).await {
+                writer
+                    .send(crate::ClientToServerMessage::CryptSetup(reply))
+                    .await?;
+            }
+            continue;
+        }
         apply_and_publish(&state, &events_tx, message)?;
     }
 
@@ -299,6 +325,7 @@ async fn connect_over(
             run_state,
             audio_tx,
             events_tx.clone(),
+            udp,
             server_rx,
             run_cancel,
         )
@@ -321,6 +348,7 @@ async fn connect_over(
             cancel: cancellation_token,
             outgoing: server_tx,
             self_muted: Arc::new(AtomicBool::new(false)),
+            voice_over_udp,
         },
         events: events_rx,
         debug: debug_rx,
@@ -342,17 +370,45 @@ fn apply_and_publish(
     Ok(())
 }
 
+#[expect(clippy::too_many_arguments)]
 async fn run(
     mut reader: impl Stream<Item = Result<ServerToClientMessage, io::Error>> + Unpin + Send + 'static,
     mut writer: impl Sink<crate::ClientToServerMessage, Error = io::Error> + Unpin + Send + 'static,
     state: Arc<Mutex<MumbleState>>,
     audio_tx: tokio::sync::mpsc::Sender<crate::raw_udp::Audio>,
     events_tx: mpsc::UnboundedSender<crate::state::MumbleEvent>,
+    mut udp: UdpVoice,
     mut server_rx: mpsc::UnboundedReceiver<crate::ClientToServerMessage>,
     cancellation_token: CancellationToken,
 ) -> Result<(), MumbleConnectionError> {
     // Mumble requires pings every 30s by default; be eager.
-    let mut ping_interval = tokio::time::interval(std::time::Duration::from_secs(15));
+    let mut ping_interval = tokio::time::interval(Duration::from_secs(15));
+    // UdpVoice decides when to actually ping; this only needs to tick faster
+    // than its probe interval.
+    let mut udp_tick = tokio::time::interval(Duration::from_millis(250));
+    udp_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut udp_buf = vec![0u8; crate::udp::MAX_DATAGRAM];
+    let epoch = Instant::now();
+
+    // Handles a message from the server, whether it came over TCP or UDP.
+    let deliver = |message: ServerToClientMessage| {
+        // Voice goes to the audio task to be played; the state only
+        // tracks who is speaking.
+        if let ServerToClientMessage::UdpTunnel(ServerToClientUdpMessage::Audio(m)) = &message
+            && let Err(e) = audio_tx.try_send(m.clone())
+        {
+            log::error!("Dropping voice packet: {e}");
+        }
+        // One bad update (e.g. a UserState for an unknown channel) must not
+        // end the call; the handshake above is where errors are fatal.
+        if let Err(e) = apply_and_publish(&state, &events_tx, message) {
+            log::warn!("Ignoring server message that could not be applied: {e}");
+            // send() only fails if nobody is listening; ignore that
+            let _ = events_tx.send(MumbleEvent::MessageError {
+                reason: e.to_string(),
+            });
+        }
+    };
 
     log::info!("Starting client run loop");
     loop {
@@ -364,19 +420,31 @@ async fn run(
             message = reader.try_next() => {
                 let Some(message) = message? else { break }; // None -> server closed
 
-                // Voice goes to the audio task to be played; the state only
-                // tracks who is speaking.
-                if let ServerToClientMessage::UdpTunnel(ServerToClientUdpMessage::Audio(m)) = &message
-                    && let Err(e) = audio_tx.try_send(m.clone())
-                {
-                    log::error!("Dropping voice packet: {e}");
+                // The server re-keys or resyncs UDP at any time.
+                if let ServerToClientMessage::CryptSetup(setup) = &message {
+                    if let Some(reply) = udp.on_crypt_setup(setup, Instant::now()).await {
+                        writer.send(crate::ClientToServerMessage::CryptSetup(reply)).await?;
+                    }
+                    continue;
                 }
-                // One bad update (e.g. a UserState for an unknown channel) must not
-                // end the call; the handshake above is where errors are fatal.
-                if let Err(e) = apply_and_publish(&state, &events_tx, message) {
-                    log::warn!("Ignoring server message that could not be applied: {e}");
-                    // send() only fails if nobody is listening; ignore that
-                    let _ = events_tx.send(MumbleEvent::MessageError { reason: e.to_string() });
+                deliver(message);
+            }
+            received = udp.recv(&mut udp_buf) => {
+                match received {
+                    Ok(len) => match udp.on_datagram(&udp_buf[..len], Instant::now()) {
+                        Command::Audio(audio) => deliver(ServerToClientMessage::UdpTunnel(ServerToClientUdpMessage::Audio(audio))),
+                        Command::RequestResync(setup) => writer.send(crate::ClientToServerMessage::CryptSetup(setup)).await?,
+                        Command::Nothing => {}
+                    },
+                    // E.g. ECONNREFUSED after an ICMP port-unreachable: pings
+                    // go unanswered and voice falls back to the tunnel.
+                    Err(e) => log::debug!("UDP receive failed: {e}"),
+                }
+            }
+            _ = udp_tick.tick() => {
+                // Voice fell back to the tunnel: have the server follow.
+                if let Some(ping) = udp.tick(Instant::now()).await {
+                    writer.send(crate::ClientToServerMessage::UdpTunnel(crate::ClientToServerUdpMessage::Ping(ping))).await?;
                 }
             }
             message = server_rx.recv() => {
@@ -384,10 +452,29 @@ async fn run(
                     if let crate::ClientToServerMessage::UdpTunnel(crate::ClientToServerUdpMessage::Audio(_)) = message {
                         // Audio messages are noisy.
                         // log::trace!("Sending audio message: {:?}", msg);
+                    } else if let crate::ClientToServerMessage::CryptSetup(_) = message {
+                        // Do not log crypto keys!
                     } else {
                         log::trace!("Sending message to server: {:?}", message);
                     }
-                    writer.send(message.clone()).await?;
+                    // The protocol's size limit applies to voice on either
+                    // transport; like the official client, don't send it.
+                    if let crate::ClientToServerMessage::UdpTunnel(crate::ClientToServerUdpMessage::Audio(audio)) = &message
+                        && !crate::udp::fits_datagram(audio)
+                    {
+                        log::warn!("Dropping a voice packet too large to send ({} bytes of Opus)", audio.opus_data.len());
+                        continue;
+                    }
+                    // Voice goes over UDP when that works, else through the tunnel.
+                    let sent_over_udp = match &message {
+                        crate::ClientToServerMessage::UdpTunnel(crate::ClientToServerUdpMessage::Audio(audio)) => {
+                            udp.send_audio(audio).await
+                        }
+                        _ => false,
+                    };
+                    if !sent_over_udp {
+                        writer.send(message.clone()).await?;
+                    }
 
                     // Handle any bookkeeping needed for specific messages.
                     match &message {
@@ -423,9 +510,19 @@ async fn run(
                 }
             }
             _ = ping_interval.tick() => {
-                // TODO: include timestamp in Ping.
                 log::trace!("Sending ping to server");
-                writer.send(crate::ClientToServerMessage::Ping(Default::default())).await?;
+                // The server shows these UDP counters in its connection stats.
+                let stats = udp.stats();
+                let ping = crate::raw::Ping {
+                    timestamp: Some(u64::try_from(epoch.elapsed().as_millis()).unwrap_or(u64::MAX)),
+                    good: Some(stats.good),
+                    late: Some(stats.late),
+                    lost: Some(stats.lost),
+                    resync: Some(stats.resync),
+                    udp_ping_avg: udp.rtt().map(|rtt| rtt.as_secs_f32() * 1000.0),
+                    ..Default::default()
+                };
+                writer.send(crate::ClientToServerMessage::Ping(ping)).await?;
             }
         }
     }
@@ -454,6 +551,18 @@ impl MumbleClient {
 
     pub fn state(&self) -> Arc<Mutex<MumbleState>> {
         self.state.clone()
+    }
+
+    /// Whether the voice we send currently goes over UDP. It starts on the TCP
+    /// tunnel and moves to UDP once the server answers a UDP ping.
+    ///
+    /// This says nothing certain about the voice we receive: the server picks
+    /// that transport itself, and only switches to UDP once it receives a UDP
+    /// packet from us. Until then, incoming voice arrives through the TCP
+    /// tunnel even while this returns `true`. The official client behaves the
+    /// same way.
+    pub fn is_voice_over_udp(&self) -> bool {
+        self.voice_over_udp.load(Ordering::Relaxed)
     }
 
     /// Sends one Opus packet. Set `is_terminator` on the last packet of a
@@ -556,6 +665,9 @@ impl MumbleClient {
 
     /// Mutes or unmutes the microphone: stops sending audio and tells the
     /// server (and so other users) that we are self-muted.
+    /// Note: the mute/unmute message is sent over TCP, whereas voice may be
+    /// sent over UDP, so the server may process some voice packets with an
+    /// outdated mute/unmute state. Not likely to be an issue in practice.
     pub fn set_self_mute(&self, muted: bool) -> Result<(), MumbleConnectionError> {
         self.self_muted.store(muted, Ordering::Relaxed);
         self.send(crate::ClientToServerMessage::UserState(Box::new(
@@ -603,9 +715,11 @@ impl MumbleClient {
 mod tests {
     use super::*;
     use crate::codec::{MumbleFrame, MumbleFrameCodec};
+    use crate::udp::testing::ServerCrypt;
     use crate::{TcpMessageId, UdpMessageId, raw, raw_udp};
     use prost::Message;
     use std::time::Duration;
+    use tokio::net::UdpSocket;
 
     #[test]
     fn log_preview_quotes_short_messages_whole() {
@@ -724,6 +838,11 @@ mod tests {
         /// Completes the handshake with one other user already on the server.
         async fn accept(&mut self) {
             self.greet().await;
+            self.sync().await;
+        }
+
+        /// Ends the handshake, with one other user already on the server.
+        async fn sync(&mut self) {
             self.send(user(1, "Alice")).await;
             self.send(user(2, "me")).await;
             self.send(raw::ServerSync {
@@ -756,8 +875,18 @@ mod tests {
         tokio::task::JoinHandle<Result<Connection, MumbleConnectionError>>,
         FakeServer,
     ) {
+        start_with_udp(None)
+    }
+
+    /// Like [`start`], for a server that may also be reachable over UDP.
+    fn start_with_udp(
+        udp_server: Option<SocketAddr>,
+    ) -> (
+        tokio::task::JoinHandle<Result<Connection, MumbleConnectionError>>,
+        FakeServer,
+    ) {
         let (client_end, server_end) = tokio::io::duplex(64 * 1024);
-        let connecting = tokio::spawn(connect_over(client_end, options()));
+        let connecting = tokio::spawn(connect_over(client_end, options(), udp_server));
         (
             connecting,
             FakeServer {
@@ -919,6 +1048,17 @@ mod tests {
 
         assert_eq!((audio.sender_session, audio.opus_data), (1, vec![1, 2, 3]));
         assert_eq!(user_names(&connection.client), ["Alice", "me"]);
+    }
+
+    #[tokio::test]
+    async fn voice_too_large_for_the_protocol_is_not_sent() {
+        let (connection, mut server) = connected().await;
+
+        let too_large = vec![0; crate::udp::MAX_DATAGRAM];
+        connection.client.send_audio(&too_large, 7, false).unwrap();
+        connection.client.send_audio(&[2], 8, false).unwrap();
+
+        assert_eq!(server.receive_audio().await.frame_number, 8);
     }
 
     #[tokio::test]
@@ -1327,6 +1467,127 @@ mod tests {
             events.push(event);
         }
         assert_eq!(events.len(), 1, "{events:?}");
+    }
+
+    /// The UDP side of a fake server, keyed to match `ServerCrypt::setup()`.
+    struct FakeUdpServer {
+        socket: UdpSocket,
+        crypt: ServerCrypt,
+        client: Option<SocketAddr>,
+    }
+
+    impl FakeUdpServer {
+        async fn new() -> Self {
+            Self {
+                socket: UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+                crypt: ServerCrypt::new(),
+                client: None,
+            }
+        }
+
+        /// The next datagram from the client, decrypted: its type and body.
+        async fn receive(&mut self) -> (u8, Vec<u8>) {
+            let mut buf = [0; crate::udp::MAX_DATAGRAM];
+            let (len, from) = tokio::time::timeout(TIMEOUT, self.socket.recv_from(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
+            self.client = Some(from);
+            self.crypt.open(&buf[..len])
+        }
+
+        /// The next voice packet the client sent over UDP, skipping pings.
+        async fn receive_audio(&mut self) -> raw_udp::Audio {
+            loop {
+                let (kind, body) = self.receive().await;
+                if kind == raw_udp::Audio::TYPE_ID {
+                    return raw_udp::Audio::decode(body.as_slice()).unwrap();
+                }
+            }
+        }
+
+        async fn send(&mut self, kind: u8, message: &impl Message) {
+            let sealed = self.crypt.seal(kind, message);
+            let client = self.client.expect("the client has not sent anything yet");
+            self.socket.send_to(&sealed, client).await.unwrap();
+        }
+    }
+
+    /// Connects with UDP keys sent during the handshake, as real servers do.
+    async fn connected_with_udp(udp: &FakeUdpServer) -> (Connection, FakeServer) {
+        let (connecting, mut server) = start_with_udp(Some(udp.socket.local_addr().unwrap()));
+        server.greet().await;
+        server.send(ServerCrypt::setup()).await;
+        server.sync().await;
+        let connection = tokio::time::timeout(TIMEOUT, connecting)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        (connection, server)
+    }
+
+    #[tokio::test]
+    async fn voice_moves_to_udp_once_the_server_answers() {
+        let mut udp = FakeUdpServer::new().await;
+        let (mut connection, mut server) = connected_with_udp(&udp).await;
+
+        // The client pings over UDP; until the server answers, voice is tunnelled.
+        let (kind, ping) = udp.receive().await;
+        assert_eq!(kind, raw_udp::Ping::TYPE_ID);
+        assert!(!connection.client.is_voice_over_udp());
+        connection.client.send_audio(&[1], 1, false).unwrap();
+        assert_eq!(server.receive_audio().await.frame_number, 1);
+
+        let ping = raw_udp::Ping::decode(ping.as_slice()).unwrap();
+        udp.send(raw_udp::Ping::TYPE_ID, &ping).await;
+        wait_until(|| connection.client.is_voice_over_udp()).await;
+
+        // Our voice now goes over UDP...
+        connection.client.send_audio(&[2], 2, false).unwrap();
+        assert_eq!(udp.receive_audio().await.frame_number, 2);
+
+        // ...and so does the server's.
+        let audio = raw_udp::Audio {
+            sender_session: 1,
+            frame_number: 5,
+            opus_data: vec![9],
+            ..Default::default()
+        };
+        udp.send(raw_udp::Audio::TYPE_ID, &audio).await;
+        let received = tokio::time::timeout(TIMEOUT, connection.audio.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(received, audio);
+        // (We are speaking too: our own burst has not ended.)
+        wait_until(|| speaking(&connection.client).contains(&"Alice".to_string())).await;
+    }
+
+    #[tokio::test]
+    async fn voice_stays_on_tcp_when_udp_gets_no_answer() {
+        let mut udp = FakeUdpServer::new().await;
+        let (connection, mut server) = connected_with_udp(&udp).await;
+
+        // Pinged, but never answered.
+        udp.receive().await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert!(!connection.client.is_voice_over_udp());
+        connection.client.send_audio(&[1], 1, false).unwrap();
+        assert_eq!(server.receive_audio().await.frame_number, 1);
+    }
+
+    #[tokio::test]
+    async fn answers_a_nonce_request_over_tcp() {
+        let udp = FakeUdpServer::new().await;
+        let (_connection, mut server) = connected_with_udp(&udp).await;
+
+        server.send(raw::CryptSetup::default()).await;
+
+        let reply = server.receive_message::<raw::CryptSetup>().await;
+        assert!(reply.client_nonce.is_some());
+        assert!(reply.key.is_none() && reply.server_nonce.is_none());
     }
 
     async fn wait_until(condition: impl Fn() -> bool) {
