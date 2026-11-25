@@ -15,9 +15,12 @@
 //! - `MUMBLE_PASSWORD` (default: `test`)
 
 use mumbo_sdk::ServerToClientMessage;
-use mumbo_sdk::client::{Connection, ConnectionOptions, SelfMuteStatus, connect};
+use mumbo_sdk::client::{
+    Connection, ConnectionOptions, MumbleConnectionError, SelfMuteStatus, connect,
+};
 use mumbo_sdk::raw::permission_denied::DenyType;
-use mumbo_sdk::state::{ConnectionStatus, MumbleState, TextMessage};
+use mumbo_sdk::raw::reject::RejectType;
+use mumbo_sdk::state::{ConnectionStatus, DisconnectReason, MumbleEvent, MumbleState, TextMessage};
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
@@ -50,18 +53,21 @@ impl Drop for TestConnection {
     }
 }
 
-/// Joins the server as a new user. `role` only makes the name readable in the
-/// server's logs.
-async fn join(role: &str) -> TestConnection {
+/// A name no other test uses. `role` only makes it readable in the server's logs.
+fn unique_name(role: &str) -> String {
     // Unique names: a duplicate name kicks the earlier session.
     static NEXT: AtomicU32 = AtomicU32::new(0);
-    let username = format!(
+    format!(
         "sdk-test-{role}-{}-{}",
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)
-    );
+    )
+}
+
+/// How to reach the test server as `username`.
+fn options(username: &str) -> ConnectionOptions {
     // Defaults match dev/mumble-server/compose.yaml.
-    let options = ConnectionOptions {
+    ConnectionOptions {
         server: std::env::var("MUMBLE_SERVER").unwrap_or("localhost".into()),
         port: Some(
             std::env::var("MUMBLE_PORT")
@@ -69,13 +75,37 @@ async fn join(role: &str) -> TestConnection {
                 .unwrap_or(64738),
         ),
         password: Some(std::env::var("MUMBLE_PASSWORD").unwrap_or("test".into())),
-        username: Some(username.clone()),
-    };
+        username: Some(username.to_string()),
+    }
+}
+
+/// Joins the server as a new user. `role` only makes the name readable in the
+/// server's logs.
+async fn join(role: &str) -> TestConnection {
+    join_as(&unique_name(role)).await
+}
+
+async fn join_as(username: &str) -> TestConnection {
     TestConnection(
-        connect(options)
+        connect(options(username))
             .await
             .unwrap_or_else(|e| panic!("{username} couldn't connect: {e}")),
     )
+}
+
+/// Waits for `connection` to end, and says why it did.
+async fn disconnect_reason(connection: &mut Connection) -> DisconnectReason {
+    timeout(TIMEOUT, async {
+        loop {
+            match connection.events.recv().await {
+                Some(MumbleEvent::Disconnected { reason }) => return reason,
+                Some(_) => continue,
+                None => panic!("events ended without a Disconnected"),
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for the connection to end")
 }
 
 fn my_session(connection: &Connection) -> u32 {
@@ -176,6 +206,47 @@ async fn connecting_syncs_the_server_state() {
         s.message_length.zip(s.image_message_length)
     })
     .await;
+}
+
+#[tokio::test]
+#[ignore = "needs a live Mumble server; see the top of this file"]
+async fn connecting_again_under_our_name_removes_us_and_says_why() {
+    let name = unique_name("twice");
+    let mut first = join_as(&name).await;
+
+    // Murmur lets only one session use a name, so it removes the first.
+    let _second = join_as(&name).await;
+
+    assert_eq!(
+        disconnect_reason(&mut first).await,
+        DisconnectReason::Removed {
+            reason: Some("You connected to the server from another device".into()),
+            actor: None,
+            banned: false,
+        }
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs a live Mumble server; see the top of this file"]
+async fn a_wrong_server_password_is_rejected() {
+    let options = ConnectionOptions {
+        password: Some("not the password".into()),
+        ..options(&unique_name("wrong-password"))
+    };
+
+    let error = connect(options).await.err().expect("the server refused us");
+
+    assert!(
+        matches!(
+            error,
+            MumbleConnectionError::Rejected {
+                kind: RejectType::WrongServerPw,
+                ..
+            }
+        ),
+        "{error:?}"
+    );
 }
 
 #[tokio::test]

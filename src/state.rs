@@ -143,10 +143,30 @@ pub enum MumbleEvent {
         reason: String,
     },
     /// The connection has ended; no more events will follow.
-    /// `reason` is `None` for a clean disconnect, otherwise an error string.
     Disconnected {
-        reason: Option<String>,
+        reason: DisconnectReason,
     },
+}
+
+/// Why a connection ended.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub enum DisconnectReason {
+    /// The app asked to disconnect, e.g. with [`crate::client::MumbleClient::disconnect`].
+    Requested,
+    /// The server removed us: an admin kicked or banned us, or we connected
+    /// again from elsewhere with the same name.
+    Removed {
+        /// The server's explanation, if it gave one.
+        reason: Option<String>,
+        /// The session of the admin who removed us, if anyone did.
+        actor: Option<u32>,
+        banned: bool,
+    },
+    /// The server closed the connection without saying why.
+    ServerClosed,
+    /// The connection failed, e.g. it broke or the server sent something
+    /// we couldn't read.
+    Failed { error: String },
 }
 
 #[derive(Default, Clone, Debug, Serialize)]
@@ -168,6 +188,10 @@ pub struct MumbleState {
     pub current_user_session: Option<u32>,
 
     pub chat_messages: Vec<TextMessage>,
+
+    /// Set once the server removes us, so the connection can report why it ended.
+    #[serde(skip)]
+    pub(crate) removed: Option<DisconnectReason>,
 }
 
 impl MumbleState {
@@ -335,6 +359,14 @@ impl MumbleState {
                 return Ok(Some(MumbleEvent::UsersChanged));
             }
             crate::ServerToClientMessage::UserRemove(m) => {
+                if Some(m.session) == self.current_user_session {
+                    self.removed = Some(DisconnectReason::Removed {
+                        // Murmur sends an empty reason when there isn't one.
+                        reason: m.reason.clone().filter(|reason| !reason.is_empty()),
+                        actor: m.actor,
+                        banned: m.ban.unwrap_or(false),
+                    });
+                }
                 let removed = self.users.remove(&m.session);
                 if let Some(removed) = removed {
                     log::info!(
