@@ -18,7 +18,7 @@ use tokio_util::{
 
 mod accept_any_cert;
 
-use crate::state::MumbleEvent;
+use crate::state::{DisconnectReason, MumbleEvent};
 use crate::udp::{Command, UdpVoice};
 use crate::{
     ServerToClientMessage, ServerToClientUdpMessage, UdpMessageId,
@@ -78,6 +78,13 @@ pub enum MumbleConnectionError {
 
     #[error("Unexpected server close")]
     UnexpectedServerClose,
+
+    /// The server refused us while connecting, e.g. for a wrong password.
+    #[error("Server rejected connection: {} - {}", kind.as_str_name(), reason.as_deref().unwrap_or("no reason given"))]
+    Rejected {
+        kind: crate::raw::reject::RejectType,
+        reason: Option<String>,
+    },
 
     #[error("Disconnected from server")]
     Disconnected,
@@ -310,6 +317,13 @@ async fn connect_over(
             }
             continue;
         }
+        if let ServerToClientMessage::Reject(reject) = &message {
+            log::error!("Server rejected connection: {reject:?}");
+            return Err(MumbleConnectionError::Rejected {
+                kind: reject.r#type(),
+                reason: reject.reason.clone().filter(|reason| !reason.is_empty()),
+            });
+        }
         apply_and_publish(&state, &events_tx, message)?;
     }
 
@@ -317,6 +331,7 @@ async fn connect_over(
 
     let cancellation_token = CancellationToken::new();
     let run_state = state.clone();
+    let reason_state = state.clone();
     let run_cancel = cancellation_token.clone();
     tokio::spawn(async move {
         let result = run(
@@ -331,11 +346,18 @@ async fn connect_over(
         )
         .await;
 
-        let reason = match result {
-            Ok(()) => None,
-            Err(e) => {
+        let removed = reason_state.lock().unwrap().removed.clone();
+        let reason = match (removed, result) {
+            // The server hangs up right after removing us, often without a
+            // clean TLS shutdown; the removal is what explains it.
+            (Some(removed), _) => removed,
+            (None, Ok(RunEnded::Requested)) => DisconnectReason::Requested,
+            (None, Ok(RunEnded::ServerClosed)) => DisconnectReason::ServerClosed,
+            (None, Err(e)) => {
                 log::error!("connection ended: {e}");
-                Some(e.to_string())
+                DisconnectReason::Failed {
+                    error: e.to_string(),
+                }
             }
         };
         // send() only fails if nobody is listening; ignore that
@@ -370,6 +392,14 @@ fn apply_and_publish(
     Ok(())
 }
 
+/// Why [`run`] stopped, when nothing went wrong.
+enum RunEnded {
+    /// The app disconnected, or dropped every handle to the connection.
+    Requested,
+    /// The server closed the connection.
+    ServerClosed,
+}
+
 #[expect(clippy::too_many_arguments)]
 async fn run(
     mut reader: impl Stream<Item = Result<ServerToClientMessage, io::Error>> + Unpin + Send + 'static,
@@ -380,7 +410,7 @@ async fn run(
     mut udp: UdpVoice,
     mut server_rx: mpsc::UnboundedReceiver<crate::ClientToServerMessage>,
     cancellation_token: CancellationToken,
-) -> Result<(), MumbleConnectionError> {
+) -> Result<RunEnded, MumbleConnectionError> {
     // Mumble requires pings every 30s by default; be eager.
     let mut ping_interval = tokio::time::interval(Duration::from_secs(15));
     // UdpVoice decides when to actually ping; this only needs to tick faster
@@ -411,14 +441,14 @@ async fn run(
     };
 
     log::info!("Starting client run loop");
-    loop {
+    let ended = loop {
         tokio::select! {
             _ = cancellation_token.cancelled() => {
                 log::info!("Cancellation requested, shutting down client loop");
-                break;
+                break RunEnded::Requested;
             }
             message = reader.try_next() => {
-                let Some(message) = message? else { break }; // None -> server closed
+                let Some(message) = message? else { break RunEnded::ServerClosed };
 
                 // The server re-keys or resyncs UDP at any time.
                 if let ServerToClientMessage::CryptSetup(setup) = &message {
@@ -506,7 +536,7 @@ async fn run(
                     }
                 } else {
                     log::info!("Server channel closed, disconnecting");
-                    break; // Channel closed, disconnect
+                    break RunEnded::Requested; // Every handle was dropped.
                 }
             }
             _ = ping_interval.tick() => {
@@ -525,9 +555,9 @@ async fn run(
                 writer.send(crate::ClientToServerMessage::Ping(ping)).await?;
             }
         }
-    }
+    };
     log::info!("Disconnected from server");
-    Ok(())
+    Ok(ended)
 }
 
 /// `message` quoted for logs, with its middle elided if it's long: with an
@@ -1006,8 +1036,14 @@ mod tests {
             .expect("connect should fail");
 
         assert!(
-            error.to_string().contains("Invalid server password"),
-            "{error}"
+            matches!(
+                &error,
+                MumbleConnectionError::Rejected {
+                    kind: raw::reject::RejectType::WrongServerPw,
+                    reason: Some(reason),
+                } if reason == "Invalid server password"
+            ),
+            "{error:?}"
         );
     }
 
@@ -1255,12 +1291,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn disconnecting_is_reported_as_clean() {
+    async fn disconnecting_is_reported_as_requested() {
         let (mut connection, _server) = connected().await;
 
         connection.client.disconnect();
 
-        assert_eq!(disconnect_reason(&mut connection).await, None);
+        assert_eq!(
+            disconnect_reason(&mut connection).await,
+            DisconnectReason::Requested
+        );
     }
 
     #[tokio::test]
@@ -1278,12 +1317,132 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn server_hanging_up_is_reported_as_clean() {
+    async fn server_hanging_up_is_reported_as_server_closed() {
         let (mut connection, server) = connected().await;
 
         drop(server);
 
-        assert_eq!(disconnect_reason(&mut connection).await, None);
+        assert_eq!(
+            disconnect_reason(&mut connection).await,
+            DisconnectReason::ServerClosed
+        );
+    }
+
+    #[tokio::test]
+    async fn being_kicked_is_reported_with_the_servers_explanation() {
+        let (mut connection, mut server) = connected().await;
+
+        server
+            .send(raw::UserRemove {
+                session: 2,
+                actor: Some(1),
+                reason: Some("go away".to_string()),
+                ban: None,
+            })
+            .await;
+        drop(server);
+
+        assert_eq!(
+            disconnect_reason(&mut connection).await,
+            DisconnectReason::Removed {
+                reason: Some("go away".to_string()),
+                actor: Some(1),
+                banned: false,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn being_banned_is_reported() {
+        let (mut connection, mut server) = connected().await;
+
+        server
+            .send(raw::UserRemove {
+                session: 2,
+                actor: Some(1),
+                reason: Some("spam".to_string()),
+                ban: Some(true),
+            })
+            .await;
+        drop(server);
+
+        assert!(matches!(
+            disconnect_reason(&mut connection).await,
+            DisconnectReason::Removed { banned: true, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_removal_without_a_reason_has_none() {
+        let (mut connection, mut server) = connected().await;
+
+        // Murmur sends an empty reason when there isn't one.
+        server
+            .send(raw::UserRemove {
+                session: 2,
+                actor: None,
+                reason: Some(String::new()),
+                ban: None,
+            })
+            .await;
+        drop(server);
+
+        assert_eq!(
+            disconnect_reason(&mut connection).await,
+            DisconnectReason::Removed {
+                reason: None,
+                actor: None,
+                banned: false,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn someone_else_being_removed_is_not_why_we_disconnected() {
+        let (mut connection, mut server) = connected().await;
+
+        server
+            .send(raw::UserRemove {
+                session: 1,
+                actor: None,
+                reason: Some("go away".to_string()),
+                ban: None,
+            })
+            .await;
+        drop(server);
+
+        assert_eq!(
+            disconnect_reason(&mut connection).await,
+            DisconnectReason::ServerClosed
+        );
+    }
+
+    #[tokio::test]
+    async fn a_removal_explains_the_failure_that_follows_it() {
+        let (mut connection, mut server) = connected().await;
+
+        server
+            .send(raw::UserRemove {
+                session: 2,
+                actor: None,
+                reason: Some("go away".to_string()),
+                ban: None,
+            })
+            .await;
+        // A real server then hangs up without a clean TLS shutdown, which
+        // reads as an error; any fatal error stands in for it here.
+        use tokio::io::AsyncWriteExt;
+        server
+            .frames
+            .get_mut()
+            .write_all(&[0, 0, 0xff, 0xff, 0xff, 0xff])
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            disconnect_reason(&mut connection).await,
+            DisconnectReason::Removed { .. }
+        ));
     }
 
     #[tokio::test]
@@ -1301,7 +1460,7 @@ mod tests {
 
         let reason = disconnect_reason(&mut connection).await;
         assert!(
-            reason.as_deref().is_some_and(|r| r.contains("too large")),
+            matches!(&reason, DisconnectReason::Failed { error } if error.contains("too large")),
             "{reason:?}"
         );
     }
@@ -1608,7 +1767,7 @@ mod tests {
     }
 
     /// The reason the connection ended, skipping any events before it.
-    async fn disconnect_reason(connection: &mut Connection) -> Option<String> {
+    async fn disconnect_reason(connection: &mut Connection) -> DisconnectReason {
         loop {
             match next_event(connection).await {
                 Some(MumbleEvent::Disconnected { reason }) => {
